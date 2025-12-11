@@ -57,9 +57,9 @@ export default function AdminUsersPage() {
     <AdminShell>
       <div className="space-y-6">
         <div className="space-y-2">
-          <p className="text-[11px] uppercase tracking-[0.28em] text-slate-400">Admin</p>
-          <h1 className="text-3xl font-semibold">User & role management</h1>
-          <p className="text-sm text-slate-400">
+          <p className="text-[11px] uppercase tracking-[0.28em] text-slate-500">Admin</p>
+          <h1 className="text-3xl font-semibold text-slate-900">User & role management</h1>
+          <p className="text-sm text-slate-600">
             Promote observers, manage managers, and keep bidder access in sync.
           </p>
         </div>
@@ -70,28 +70,28 @@ export default function AdminUsersPage() {
           </div>
         )}
 
-        <div className="overflow-hidden rounded-3xl border border-white/5 bg-[#0c1329]">
-          <div className="grid grid-cols-4 bg-white/5 px-4 py-3 text-xs uppercase tracking-[0.14em] text-slate-400">
+        <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+          <div className="grid grid-cols-4 bg-slate-50 px-4 py-3 text-xs uppercase tracking-[0.14em] text-slate-600">
             <div>Name</div>
             <div>Email</div>
             <div>Role</div>
             <div>Actions</div>
           </div>
-          <div className="divide-y divide-white/5">
+          <div className="divide-y divide-slate-200">
             {users.length === 0 ? (
-              <div className="px-4 py-6 text-sm text-slate-400">No users found.</div>
+              <div className="px-4 py-6 text-sm text-slate-600">No users found.</div>
             ) : (
               users.map((u) => (
-                <div key={u.id} className="grid grid-cols-4 items-center px-4 py-3 text-sm text-slate-100">
-                  <div className="font-semibold">{u.name}</div>
-                  <div className="text-slate-300">{u.email}</div>
-                  <div className="text-slate-300">{u.role}</div>
+                <div key={u.id} className="grid grid-cols-4 items-center px-4 py-3 text-sm text-slate-800">
+                  <div className="font-semibold text-slate-900">{u.name}</div>
+                  <div className="text-slate-700">{u.email}</div>
+                  <div className="text-slate-700">{u.role}</div>
                   <div>
                     <select
                       value={u.role}
                       disabled={savingId === u.id}
                       onChange={(e) => updateRole(u.id, e.target.value)}
-                      className="rounded-lg bg-[#0b1224] px-3 py-2 text-sm text-white outline-none ring-1 ring-white/10"
+                      className="rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none ring-1 ring-transparent focus:ring-slate-300"
                     >
                       {roles.map((r) => (
                         <option key={r} value={r}>

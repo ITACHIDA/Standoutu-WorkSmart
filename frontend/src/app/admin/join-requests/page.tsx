@@ -55,9 +55,9 @@ export default function JoinRequestsPage() {
     <AdminShell>
       <div className="space-y-6">
         <div className="space-y-2">
-          <p className="text-[11px] uppercase tracking-[0.28em] text-slate-400">Admin</p>
-          <h1 className="text-3xl font-semibold">Join requests</h1>
-          <p className="text-sm text-slate-400">Approve observer accounts into bidder or manager roles.</p>
+          <p className="text-[11px] uppercase tracking-[0.28em] text-slate-500">Admin</p>
+          <h1 className="text-3xl font-semibold text-slate-900">Join requests</h1>
+          <p className="text-sm text-slate-600">Approve observer accounts into bidder or manager roles.</p>
         </div>
 
         {error && (
@@ -66,22 +66,22 @@ export default function JoinRequestsPage() {
           </div>
         )}
 
-        <div className="overflow-hidden rounded-3xl border border-white/5 bg-[#0c1329]">
-          <div className="grid grid-cols-4 bg-white/5 px-4 py-3 text-xs uppercase tracking-[0.14em] text-slate-400">
+        <div className="overflow-hidden rounded-3xl border border-slate-200 bg-white shadow-sm">
+          <div className="grid grid-cols-4 bg-slate-50 px-4 py-3 text-xs uppercase tracking-[0.14em] text-slate-600">
             <div>Name</div>
             <div>Email</div>
             <div>Current</div>
             <div>Actions</div>
           </div>
-          <div className="divide-y divide-white/5">
+          <div className="divide-y divide-slate-200">
             {observers.length === 0 ? (
-              <div className="px-4 py-6 text-sm text-slate-400">No pending requests.</div>
+              <div className="px-4 py-6 text-sm text-slate-600">No pending requests.</div>
             ) : (
               observers.map((u) => (
-                <div key={u.id} className="grid grid-cols-4 items-center px-4 py-3 text-sm text-slate-100">
-                  <div className="font-semibold">{u.name}</div>
-                  <div className="text-slate-300">{u.email}</div>
-                  <div className="text-slate-300">{u.role}</div>
+                <div key={u.id} className="grid grid-cols-4 items-center px-4 py-3 text-sm text-slate-800">
+                  <div className="font-semibold text-slate-900">{u.name}</div>
+                  <div className="text-slate-700">{u.email}</div>
+                  <div className="text-slate-700">{u.role}</div>
                   <div className="flex gap-2 text-xs">
                     <button
                       onClick={() => approve(u.id, "BIDDER")}
@@ -93,7 +93,7 @@ export default function JoinRequestsPage() {
                     <button
                       onClick={() => approve(u.id, "MANAGER")}
                       disabled={savingId === u.id}
-                      className="rounded-full border border-white/10 px-3 py-1 text-white hover:bg-white/10 disabled:opacity-60"
+                      className="rounded-full border border-slate-200 px-3 py-1 text-slate-800 hover:bg-slate-100 disabled:opacity-60"
                     >
                       Approve as manager
                     </button>

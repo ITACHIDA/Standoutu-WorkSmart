@@ -32,15 +32,15 @@ export default function AdminShell({ children }: { children: React.ReactNode }) 
               {links.map((link) => {
                 const active = pathname.startsWith(link.href);
                 return (
-                  <Link
-                    key={link.href}
-                    href={link.href}
-                    className={`block rounded-xl px-3 py-2 transition ${
-                      active ? "bg-[#0b1020] text-white" : "text-slate-700 hover:bg-slate-100"
-                    }`}
-                  >
-                    {link.label}
-                  </Link>
+              <Link
+                key={link.href}
+                href={link.href}
+                className={`block rounded-xl px-3 py-2 transition ${
+                  active ? "bg-slate-100 text-slate-900 border border-slate-200" : "text-slate-700 hover:bg-slate-100"
+                }`}
+              >
+                {link.label}
+              </Link>
                 );
               })}
             </aside>

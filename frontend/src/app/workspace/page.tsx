@@ -72,15 +72,6 @@ type Metrics = {
   recent: ApplicationSession[];
 };
 
-type Assignment = {
-  id: string;
-  profileId: string;
-  bidderUserId: string;
-  assignedBy: string;
-  assignedAt: string;
-  unassignedAt?: string | null;
-};
-
 async function api(path: string, init?: RequestInit) {
   const token =
     typeof window !== "undefined" ? window.localStorage.getItem("smartwork_token") : null;
@@ -124,13 +115,7 @@ export default function Page() {
   const [webviewStatus, setWebviewStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle");
   const webviewRef = useRef<Element | null>(null);
   const [isClient, setIsClient] = useState(false);
-  const [allUsers, setAllUsers] = useState<User[]>([]);
   const router = useRouter();
-  const [token, setToken] = useState<string | null>(null);
-  const [assignments, setAssignments] = useState<Assignment[]>([]);
-  const [allSessions, setAllSessions] = useState<ApplicationSession[]>([]);
-  const [assignProfileId, setAssignProfileId] = useState<string>("");
-  const [assignBidderId, setAssignBidderId] = useState<string>("");
   const browserSrc = session?.url || url || "";
   const webviewPartition = "persist:smartwork-jobview";
 
@@ -146,7 +131,6 @@ export default function Page() {
       try {
         const parsed = JSON.parse(stored) as User;
         setUser(parsed);
-        setToken(storedToken);
       } catch {
         router.replace("/auth");
       }
@@ -154,23 +138,6 @@ export default function Page() {
       router.replace("/auth");
     }
   }, [isClient, router]);
-
-  useEffect(() => {
-    if (!isClient || !token || !user || user.role === "OBSERVER") return;
-    void loadUsers();
-  }, [isClient, token, user]);
-
-  useEffect(() => {
-    if (!assignProfileId && profiles[0]) {
-      setAssignProfileId(profiles[0].id);
-    }
-  }, [assignProfileId, profiles]);
-
-  useEffect(() => {
-    if (assignBidderId) return;
-    const bidder = allUsers.find((u) => u.role === "BIDDER");
-    if (bidder) setAssignBidderId(bidder.id);
-  }, [assignBidderId, allUsers]);
 
   const desktopBridge: DesktopBridge | undefined =
     isClient && typeof window !== "undefined"
@@ -182,16 +149,6 @@ export default function Page() {
     () => profiles.find((p) => p.id === selectedProfileId),
     [profiles, selectedProfileId]
   );
-  const userById = useMemo(() => {
-    const map = new Map<string, User>();
-    allUsers.forEach((u) => map.set(u.id, u));
-    return map;
-  }, [allUsers]);
-  const profileById = useMemo(() => {
-    const map = new Map<string, Profile>();
-    profiles.forEach((p) => map.set(p.id, p));
-    return map;
-  }, [profiles]);
 
   const appliedPct = metrics ? `${metrics.appliedPercentage}%` : "0%";
   const monthlyApplied = metrics?.monthlyApplied ?? 0;
@@ -205,40 +162,6 @@ export default function Page() {
       console.error(err);
     }
   }
-
-  async function loadUsers() {
-    try {
-      const list: User[] = await api("/users");
-      setAllUsers(list);
-    } catch (err) {
-      console.error(err);
-      setError("Unable to load users.");
-    }
-  }
-
-  const refreshAssignments = useCallback(async () => {
-    try {
-      const data: Assignment[] = await api("/assignments");
-      setAssignments(data);
-    } catch (err) {
-      console.error(err);
-    }
-  }, []);
-
-  const refreshSessions = useCallback(
-    async (forUser?: User | null) => {
-      try {
-        const target = forUser ?? user;
-        const query =
-          target && target.role === "BIDDER" ? `?bidderUserId=${target.id}` : "";
-      const list: ApplicationSession[] = await api(`/sessions${query}`);
-        setAllSessions(list);
-      } catch (err) {
-        console.error(err);
-      }
-    },
-    [user]
-  );
 
   const refreshMetrics = useCallback(
     async (bidderId?: string) => {
@@ -345,7 +268,6 @@ export default function Page() {
       });
       setStatus("Connected to remote browser");
       void refreshMetrics();
-      void refreshSessions();
     } catch (err) {
       console.error(err);
       setError("Failed to start session. Check backend logs.");
@@ -427,45 +349,6 @@ export default function Page() {
     setEditingBaseInfo(false);
   }
 
-  async function handleAssignProfileToBidder() {
-    if (!assignProfileId || !assignBidderId || !user) return;
-    setLoadingAction("assign");
-    setError("");
-    try {
-      await api("/assignments", {
-        method: "POST",
-        body: JSON.stringify({
-          profileId: assignProfileId,
-          bidderUserId: assignBidderId,
-          assignedBy: user.id,
-        }),
-      });
-      await refreshAssignments();
-    } catch (err) {
-      console.error(err);
-      setError("Failed to assign profile.");
-    } finally {
-      setLoadingAction("");
-    }
-  }
-
-  async function handleUnassign(assignmentId: string) {
-    setLoadingAction("unassign");
-    setError("");
-    try {
-      await api(`/assignments/${assignmentId}/unassign`, { method: "POST" });
-      await refreshAssignments();
-    } catch (err) {
-      console.error(err);
-      setError("Failed to unassign profile.");
-    } finally {
-      setLoadingAction("");
-    }
-  }
-
-  const activeAssignments = assignments.filter((a) => !a.unassignedAt);
-  const bidderOptions = allUsers.filter((u) => u.role === "BIDDER");
-
   useEffect(() => {
     const fetchForUser = async () => {
       if (!user || user.role === "OBSERVER") return;
@@ -474,10 +357,7 @@ export default function Page() {
         setProfiles(profs);
         const defaultProfileId = profs[0]?.id ?? "";
         setSelectedProfileId(defaultProfileId);
-        setAssignProfileId(defaultProfileId);
         void refreshMetrics(user.id);
-        void refreshAssignments();
-        void refreshSessions(user);
         if (defaultProfileId) {
           void loadResumes(defaultProfileId);
         } else {
@@ -488,7 +368,7 @@ export default function Page() {
       }
     };
     void fetchForUser();
-  }, [user, refreshMetrics, refreshAssignments, refreshSessions]);
+  }, [user, refreshMetrics]);
 
   if (!user) {
     return (
@@ -971,143 +851,6 @@ export default function Page() {
           <div />
         )}
 
-        {user && (user.role === "ADMIN" || user.role === "MANAGER") && (
-          <section className="rounded-3xl border border-slate-200 bg-white p-4 space-y-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <p className="text-[10px] uppercase tracking-[0.28em] text-slate-700">
-                  Admin & Manager
-                </p>
-                <p className="text-lg font-semibold">Assignments & oversight</p>
-              </div>
-              <span className="rounded-full bg-slate-100 px-3 py-1 text-[11px] text-slate-800">
-                Org visibility
-              </span>
-            </div>
-            <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-              <div className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <p className="text-sm font-semibold">Assign profile</p>
-                  <span className="text-[11px] text-slate-700">Profiles x bidders</span>
-                </div>
-                <div className="space-y-3 text-sm text-slate-800">
-                  <div>
-                    <p className="mb-1 text-xs text-slate-700">Profile</p>
-                    <select
-                      value={assignProfileId}
-                      onChange={(e) => setAssignProfileId(e.target.value)}
-                      className="w-full rounded-xl bg-slate-100 px-3 py-2 text-sm text-slate-900 outline-none ring-1 ring-white/10"
-                    >
-                      {profiles.map((p) => (
-                        <option key={p.id} value={p.id}>
-                          {p.displayName}
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <p className="mb-1 text-xs text-slate-700">Bidder</p>
-                    <select
-                      value={assignBidderId}
-                      onChange={(e) => setAssignBidderId(e.target.value)}
-                      className="w-full rounded-xl bg-slate-100 px-3 py-2 text-sm text-slate-900 outline-none ring-1 ring-white/10"
-                    >
-                      {bidderOptions.map((b) => (
-                        <option key={b.id} value={b.id}>
-                          {b.name} ({b.email})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                  <button
-                    onClick={handleAssignProfileToBidder}
-                    disabled={loadingAction === "assign" || !assignProfileId || !assignBidderId}
-                    className="w-full rounded-xl bg-[#4ade80] px-4 py-2 text-sm font-semibold text-[#0b1224] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
-                  >
-                    {loadingAction === "assign" ? "Assigning..." : "Assign now"}
-                  </button>
-                  <p className="text-[11px] text-slate-500">
-                    One active assignment per profile. Reassigning will require unassigning first.
-                  </p>
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <p className="text-sm font-semibold">Active assignments</p>
-                  <span className="text-[11px] text-slate-700">{activeAssignments.length}</span>
-                </div>
-                <div className="space-y-2 text-sm text-slate-800 max-h-[280px] overflow-auto pr-1">
-                  {activeAssignments.length === 0 ? (
-                    <div className="text-xs text-slate-700">No active assignments.</div>
-                  ) : (
-                    activeAssignments.map((a) => {
-                      const prof = profileById.get(a.profileId);
-                      const bidder = userById.get(a.bidderUserId);
-                      return (
-                        <div
-                          key={a.id}
-                          className="rounded-xl border border-slate-200 bg-slate-100 px-3 py-2"
-                        >
-                          <div className="flex items-center justify-between">
-                            <div>
-                              <p className="text-sm font-semibold">{prof?.displayName ?? "Unknown profile"}</p>
-                              <p className="text-[11px] text-slate-700">
-                                Bidder: {bidder?.name ?? "Unknown"} ({bidder?.email ?? "?"})
-                              </p>
-                            </div>
-                            <button
-                              onClick={() => handleUnassign(a.id)}
-                              disabled={loadingAction === "unassign"}
-                              className="text-[11px] text-red-300 hover:underline disabled:cursor-not-allowed disabled:opacity-60"
-                            >
-                              Unassign
-                            </button>
-                          </div>
-                          <div className="text-[11px] text-slate-500">
-                            Since {new Date(a.assignedAt).toLocaleDateString()}
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-
-              <div className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3">
-                <div className="flex items-center justify-between">
-                  <p className="text-sm font-semibold">Recent sessions</p>
-                  <span className="text-[11px] text-slate-700">{allSessions.length}</span>
-                </div>
-                <div className="space-y-2 text-sm text-slate-800 max-h-[280px] overflow-auto pr-1">
-                  {allSessions.length === 0 ? (
-                    <div className="text-xs text-slate-700">No sessions yet.</div>
-                  ) : (
-                    allSessions.slice(0, 6).map((s) => {
-                      const bidder = userById.get(s.bidderUserId);
-                      return (
-                        <div
-                          key={s.id}
-                          className="rounded-xl border border-slate-200 bg-slate-100 px-3 py-2"
-                        >
-                          <div className="flex items-center justify-between">
-                            <p className="text-sm font-semibold">{safeHostname(s.url)}</p>
-                            <span className="rounded-full bg-slate-100lack/40 px-2 py-1 text-[11px] text-slate-800">
-                              {s.status}
-                            </span>
-                          </div>
-                          <div className="text-[11px] text-slate-700">
-                            {`${bidder?.name ?? "Unknown"} -> ${new Date(s.startedAt ?? "").toLocaleDateString()}`}
-                          </div>
-                        </div>
-                      );
-                    })
-                  )}
-                </div>
-              </div>
-            </div>
-          </section>
-        )}
       </div>
     </main>
   );
@@ -1164,8 +907,4 @@ function safeHostname(url: string) {
     return "N/A";
   }
 }
-
-
-
-
 

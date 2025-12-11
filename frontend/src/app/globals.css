@@ -1,0 +1,29 @@
+@import "tailwindcss";
+
+:root {
+  --background: #0b1224;
+  --foreground: #e9eef7;
+  --card: #0f162b;
+  --panel: #111a32;
+  --accent: #5ef3c5;
+  --accent-strong: #3cc7f7;
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-display);
+  --font-mono: var(--font-mono);
+}
+
+body {
+  background: radial-gradient(circle at 20% 20%, #142042 0, #0b1224 40%),
+    radial-gradient(circle at 80% 0%, #122b3c 0, #0b1224 55%);
+  color: var(--foreground);
+  font-family: var(--font-display), system-ui, -apple-system, sans-serif;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: #334266 transparent;
+}

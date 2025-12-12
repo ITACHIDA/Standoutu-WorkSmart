@@ -1,14 +1,5 @@
 import { Pool } from 'pg';
-import bcrypt from 'bcryptjs';
-import {
-  assignments,
-  llmSettings,
-  profiles,
-  resumes,
-  profileResumes,
-  users as seedUsers,
-} from './data';
-import { ProfileResume, Resume, User } from './types';
+import { Assignment, Profile, Resume, User } from './types';
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -39,17 +30,10 @@ export async function initDb() {
 
       CREATE TABLE IF NOT EXISTS resumes (
         id UUID PRIMARY KEY,
+        profile_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
         label TEXT NOT NULL,
         file_path TEXT,
         resume_text TEXT,
-        resume_json JSONB,
-        created_at TIMESTAMP DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS profile_resumes (
-        id UUID PRIMARY KEY,
-        profile_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
-        resume_id UUID REFERENCES resumes(id) ON DELETE CASCADE,
         created_at TIMESTAMP DEFAULT NOW()
       );
 
@@ -98,72 +82,7 @@ export async function initDb() {
       );
     `);
 
-    for (const u of seedUsers) {
-      const hashed = await bcrypt.hash(u.password || 'demo', 8);
-      await client.query(
-        `
-          INSERT INTO users (id, email, name, role, password, is_active)
-          VALUES ($1, $2, $3, $4, $5, $6)
-          ON CONFLICT (email) DO NOTHING;
-        `,
-        [u.id, u.email, u.name, u.role, hashed, u.isActive ?? true],
-      );
-    }
-
-    for (const p of profiles) {
-      await client.query(
-        `
-          INSERT INTO profiles (id, display_name, base_info, created_by, created_at, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6)
-          ON CONFLICT (id) DO NOTHING;
-        `,
-        [p.id, p.displayName, JSON.stringify(p.baseInfo ?? {}), p.createdBy, p.createdAt, p.updatedAt],
-      );
-    }
-
-    for (const r of resumes) {
-      await client.query(
-        `
-          INSERT INTO resumes (id, label, file_path, resume_text, resume_json, created_at)
-          VALUES ($1, $2, $3, $4, $5, $6)
-          ON CONFLICT (id) DO NOTHING;
-        `,
-        [r.id, r.label, r.filePath, r.resumeText, JSON.stringify(r.resumeJson ?? {}), r.createdAt],
-      );
-    }
-
-    for (const pr of profileResumes) {
-      await client.query(
-        `
-          INSERT INTO profile_resumes (id, profile_id, resume_id, created_at)
-          VALUES ($1, $2, $3, $4)
-          ON CONFLICT (id) DO NOTHING;
-        `,
-        [pr.id, pr.profileId, pr.resumeId, pr.createdAt],
-      );
-    }
-
-    for (const a of assignments) {
-      await client.query(
-        `
-          INSERT INTO assignments (id, profile_id, bidder_user_id, assigned_by, assigned_at, unassigned_at)
-          VALUES ($1, $2, $3, $4, $5, $6)
-          ON CONFLICT (id) DO NOTHING;
-        `,
-        [a.id, a.profileId, a.bidderUserId, a.assignedBy, a.assignedAt, a.unassignedAt],
-      );
-    }
-
-    for (const l of llmSettings) {
-      await client.query(
-        `
-          INSERT INTO llm_settings (id, owner_type, owner_id, provider, encrypted_api_key, chat_model, embed_model, updated_at)
-          VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-          ON CONFLICT (id) DO NOTHING;
-        `,
-        [l.id, l.ownerType, l.ownerId, l.provider, l.encryptedApiKey, l.chatModel, l.embedModel, l.updatedAt],
-      );
-    }
+    // No seed data inserted; database starts empty.
   } finally {
     client.release();
   }
@@ -221,6 +140,61 @@ export async function insertProfile(profile: {
   );
 }
 
+export async function listProfiles(): Promise<Profile[]> {
+  const { rows } = await pool.query<Profile>(
+    `
+      SELECT
+        id,
+        display_name AS "displayName",
+        base_info AS "baseInfo",
+        created_by AS "createdBy",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM profiles
+      ORDER BY created_at DESC
+    `,
+  );
+  return rows;
+}
+
+export async function listProfilesForBidder(bidderUserId: string): Promise<Profile[]> {
+  const { rows } = await pool.query<Profile>(
+    `
+      SELECT
+        p.id,
+        p.display_name AS "displayName",
+        p.base_info AS "baseInfo",
+        p.created_by AS "createdBy",
+        p.created_at AS "createdAt",
+        p.updated_at AS "updatedAt"
+      FROM profiles p
+      INNER JOIN assignments a ON a.profile_id = p.id AND a.unassigned_at IS NULL
+      WHERE a.bidder_user_id = $1
+      ORDER BY p.created_at DESC
+    `,
+    [bidderUserId],
+  );
+  return rows;
+}
+
+export async function findProfileById(id: string): Promise<Profile | undefined> {
+  const { rows } = await pool.query<Profile>(
+    `
+      SELECT
+        id,
+        display_name AS "displayName",
+        base_info AS "baseInfo",
+        created_by AS "createdBy",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM profiles
+      WHERE id = $1
+    `,
+    [id],
+  );
+  return rows[0];
+}
+
 export async function updateProfileRecord(profile: {
   id: string;
   displayName: string;
@@ -241,41 +215,114 @@ export async function updateProfileRecord(profile: {
 export async function insertResumeRecord(resume: Resume) {
   await pool.query(
     `
-      INSERT INTO resumes (id, label, file_path, resume_text, resume_json, created_at)
+      INSERT INTO resumes (id, profile_id, label, file_path, resume_text, created_at)
       VALUES ($1, $2, $3, $4, $5, $6)
       ON CONFLICT (id) DO NOTHING
     `,
     [
       resume.id,
+      resume.profileId,
       resume.label,
       resume.filePath,
       resume.resumeText ?? null,
-      JSON.stringify(resume.resumeJson ?? {}),
       resume.createdAt,
     ],
   );
 }
 
-export async function insertProfileResumeRecord(record: ProfileResume) {
+export async function deleteResumeById(resumeId: string) {
+  await pool.query('DELETE FROM resumes WHERE id = $1', [resumeId]);
+}
+
+export async function listResumesByProfile(profileId: string): Promise<Resume[]> {
+  const { rows } = await pool.query<Resume>(
+    'SELECT id, profile_id as "profileId", label, file_path as "filePath", resume_text as "resumeText", created_at as "createdAt" FROM resumes WHERE profile_id = $1 ORDER BY created_at DESC',
+    [profileId],
+  );
+  return rows;
+}
+
+export async function findResumeById(resumeId: string): Promise<Resume | undefined> {
+  const { rows } = await pool.query<Resume>(
+    'SELECT id, profile_id as "profileId", label, file_path as "filePath", resume_text as "resumeText", created_at as "createdAt" FROM resumes WHERE id = $1',
+    [resumeId],
+  );
+  return rows[0];
+}
+
+export async function listAssignments(): Promise<Assignment[]> {
+  const { rows } = await pool.query<Assignment>(
+    `
+      SELECT
+        id,
+        profile_id AS "profileId",
+        bidder_user_id AS "bidderUserId",
+        assigned_by AS "assignedBy",
+        assigned_at AS "assignedAt",
+        unassigned_at AS "unassignedAt"
+      FROM assignments
+      ORDER BY assigned_at DESC
+    `,
+  );
+  return rows;
+}
+
+export async function findActiveAssignmentByProfile(
+  profileId: string,
+): Promise<Assignment | undefined> {
+  const { rows } = await pool.query<Assignment>(
+    `
+      SELECT
+        id,
+        profile_id AS "profileId",
+        bidder_user_id AS "bidderUserId",
+        assigned_by AS "assignedBy",
+        assigned_at AS "assignedAt",
+        unassigned_at AS "unassignedAt"
+      FROM assignments
+      WHERE profile_id = $1 AND unassigned_at IS NULL
+      ORDER BY assigned_at DESC
+      LIMIT 1
+    `,
+    [profileId],
+  );
+  return rows[0];
+}
+
+export async function insertAssignmentRecord(assignment: Assignment) {
   await pool.query(
     `
-      INSERT INTO profile_resumes (id, profile_id, resume_id, created_at)
-      VALUES ($1, $2, $3, $4)
-      ON CONFLICT (id) DO NOTHING
+      INSERT INTO assignments (id, profile_id, bidder_user_id, assigned_by, assigned_at, unassigned_at)
+      VALUES ($1, $2, $3, $4, $5, $6)
     `,
-    [record.id, record.profileId, record.resumeId, record.createdAt],
+    [
+      assignment.id,
+      assignment.profileId,
+      assignment.bidderUserId,
+      assignment.assignedBy,
+      assignment.assignedAt,
+      assignment.unassignedAt ?? null,
+    ],
   );
 }
 
-export async function deleteProfileResume(profileId: string, resumeId: string) {
-  await pool.query('DELETE FROM profile_resumes WHERE profile_id = $1 AND resume_id = $2', [
-    profileId,
-    resumeId,
-  ]);
-}
-
-export async function deleteResumeById(resumeId: string) {
-  await pool.query('DELETE FROM resumes WHERE id = $1', [resumeId]);
+export async function closeAssignmentById(id: string): Promise<Assignment | undefined> {
+  const { rows } = await pool.query<Assignment>(
+    `
+      UPDATE assignments
+      SET unassigned_at = NOW()
+      WHERE id = $1 AND unassigned_at IS NULL
+      RETURNING
+        id,
+        profile_id AS "profileId",
+        bidder_user_id AS "bidderUserId",
+        assigned_by AS "assignedBy",
+        assigned_at AS "assignedAt",
+        unassigned_at AS "unassignedAt"
+    `,
+    [id],
+  );
+  return rows[0];
 }
 
 export type BidderSummary = {

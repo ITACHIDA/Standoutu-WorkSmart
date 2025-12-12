@@ -1,7 +1,7 @@
-'use client';
+﻿'use client';
 import { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
-import { api } from "../../../lib/api";
+import { api, API_BASE } from "../../../lib/api";
 import { useAuth } from "../../../lib/useAuth";
 import ManagerShell from "../../../components/ManagerShell";
 
@@ -26,7 +26,26 @@ type Resume = {
   id: string;
   profileId: string;
   label: string;
+  filePath?: string;
+  resumeText?: string;
   createdAt: string;
+};
+
+type Assignment = {
+  id: string;
+  profileId: string;
+  bidderUserId: string;
+  assignedBy: string;
+  assignedAt: string;
+  unassignedAt?: string | null;
+};
+
+type User = {
+  id: string;
+  email: string;
+  name: string;
+  role: "ADMIN" | "MANAGER" | "BIDDER" | "OBSERVER";
+  isActive?: boolean;
 };
 
 export default function ManagerProfilesPage() {
@@ -35,19 +54,38 @@ export default function ManagerProfilesPage() {
   const [profiles, setProfiles] = useState<Profile[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
   const [resumes, setResumes] = useState<Resume[]>([]);
+  const [assignments, setAssignments] = useState<Assignment[]>([]);
+  const [bidders, setBidders] = useState<User[]>([]);
   const [draftBase, setDraftBase] = useState<BaseInfo>({});
   const [newResumeLabel, setNewResumeLabel] = useState("");
   const [newResumeFile, setNewResumeFile] = useState<File | null>(null);
   const [showResumeModal, setShowResumeModal] = useState(false);
+  const [viewResume, setViewResume] = useState<Resume | null>(null);
+  const [viewUrl, setViewUrl] = useState<string>("");
+  const [viewError, setViewError] = useState<string>("");
   const [detailOpen, setDetailOpen] = useState(false);
+  const [addOpen, setAddOpen] = useState(false);
   const [saving, setSaving] = useState(false);
   const [savingResumeId, setSavingResumeId] = useState<string | null>(null);
   const [error, setError] = useState("");
   const [editing, setEditing] = useState(false);
+  const [assignLoading, setAssignLoading] = useState(false);
+  const [assignBidderId, setAssignBidderId] = useState<string>("");
+  const [createLoading, setCreateLoading] = useState(false);
+  const [createForm, setCreateForm] = useState({
+    displayName: "",
+    firstName: "",
+    lastName: "",
+    email: "",
+  });
 
   const selectedProfile = useMemo(
     () => profiles.find((p) => p.id === selectedId),
     [profiles, selectedId],
+  );
+  const activeAssignment = useMemo(
+    () => assignments.find((a) => a.profileId === selectedId && !a.unassignedAt),
+    [assignments, selectedId],
   );
 
   useEffect(() => {
@@ -61,6 +99,8 @@ export default function ManagerProfilesPage() {
       return;
     }
     void loadProfiles(token);
+    void loadBidders(token);
+    void loadAssignments(token);
   }, [loading, user, token, router]);
 
   useEffect(() => {
@@ -68,6 +108,11 @@ export default function ManagerProfilesPage() {
     setDraftBase(cleanBaseInfo(selectedProfile.baseInfo));
     void loadResumes(selectedProfile.id, token);
     setEditing(false);
+    if (activeAssignment) {
+      setAssignBidderId(activeAssignment.bidderUserId);
+    } else if (bidders[0]) {
+      setAssignBidderId(bidders[0].id);
+    }
   }, [selectedProfile, token]);
 
   async function loadProfiles(authToken: string) {
@@ -76,6 +121,7 @@ export default function ManagerProfilesPage() {
       setProfiles(list);
       setSelectedId("");
       setDetailOpen(false);
+      setAddOpen(false);
     } catch (err) {
       console.error(err);
       setError("Failed to load profiles.");
@@ -89,6 +135,28 @@ export default function ManagerProfilesPage() {
     } catch (err) {
       console.error(err);
       setError("Failed to load resumes.");
+    }
+  }
+
+  async function loadAssignments(authToken: string) {
+    try {
+      const list = await api<Assignment[]>("/assignments", undefined, authToken);
+      setAssignments(list);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to load assignments.");
+    }
+  }
+
+  async function loadBidders(authToken: string) {
+    try {
+      const list = await api<User[]>("/users", undefined, authToken);
+      const filtered = list.filter((u) => u.role === "BIDDER" && u.isActive !== false);
+      setBidders(filtered);
+      if (!assignBidderId && filtered[0]) setAssignBidderId(filtered[0].id);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to load bidders.");
     }
   }
 
@@ -149,6 +217,48 @@ export default function ManagerProfilesPage() {
     }
   }
 
+  useEffect(() => {
+    if (!viewResume || !token) {
+      if (viewUrl) {
+        URL.revokeObjectURL(viewUrl);
+        setViewUrl("");
+      }
+      setViewError("");
+      return;
+    }
+    let revokeUrl = "";
+    let cancelled = false;
+    const load = async () => {
+      try {
+        setViewError("");
+        setViewUrl("");
+        const res = await fetch(`${API_BASE}/resumes/${viewResume.id}/file`, {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!res.ok) {
+          setViewError("Unable to load resume file.");
+          return;
+        }
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        if (cancelled) {
+          URL.revokeObjectURL(url);
+          return;
+        }
+        revokeUrl = url;
+        setViewUrl(url);
+      } catch (err) {
+        console.error(err);
+        setViewError("Unable to load resume file.");
+      }
+    };
+    void load();
+    return () => {
+      cancelled = true;
+      if (revokeUrl) URL.revokeObjectURL(revokeUrl);
+    };
+  }, [viewResume, token]);
+
   async function handleRemoveResume(resumeId: string) {
     if (!selectedProfile || !token) return;
     setSavingResumeId(resumeId);
@@ -165,12 +275,27 @@ export default function ManagerProfilesPage() {
   }
 
   const draft = cleanBaseInfo(draftBase);
+  const creatingDisabled =
+    createLoading || !createForm.displayName.trim() || createForm.displayName.trim().length < 2;
 
   return (
     <ManagerShell>
       <div className="grid gap-6 lg:grid-cols-[280px,1fr]">
         <aside className="space-y-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-          <div className="text-xs uppercase tracking-[0.28em] text-slate-500">Profiles</div>
+          <div className="flex items-center justify-between">
+            <div className="text-xs uppercase tracking-[0.28em] text-slate-500">Profiles</div>
+            <button
+              onClick={() => {
+                setAddOpen(true);
+                setDetailOpen(false);
+                setSelectedId("");
+                setCreateForm({ displayName: "", firstName: "", lastName: "", email: "" });
+              }}
+              className="rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-700 hover:bg-slate-100"
+            >
+              Add profile
+            </button>
+          </div>
           <div className="space-y-2">
             {profiles.length === 0 ? (
               <div className="text-sm text-slate-600">No profiles available.</div>
@@ -245,7 +370,14 @@ export default function ManagerProfilesPage() {
                       <input
                         type="file"
                         accept=".pdf,.doc,.docx,.txt"
-                        onChange={(e) => setNewResumeFile(e.target.files?.[0] ?? null)}
+                        onChange={(e) => {
+                          const file = e.target.files?.[0] ?? null;
+                          setNewResumeFile(file);
+                          if (file && !newResumeLabel.trim()) {
+                            const base = file.name.replace(/\.[^/.]+$/, "");
+                            setNewResumeLabel(base);
+                          }
+                        }}
                         className="hidden"
                       />
                       {newResumeFile && (
@@ -270,7 +402,12 @@ export default function ManagerProfilesPage() {
                   </button>
                   <button
                     onClick={handleAddResume}
-                    disabled={savingResumeId === "new" || !newResumeLabel.trim()}
+                    disabled={
+                      savingResumeId === "new" ||
+                      !newResumeLabel.trim() ||
+                      newResumeLabel.trim().length < 2 ||
+                      !newResumeFile
+                    }
                     className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
                   >
                     {savingResumeId === "new" ? "Uploading..." : "Save resume"}
@@ -279,6 +416,66 @@ export default function ManagerProfilesPage() {
               </div>
             </div>
           )}
+
+          {addOpen && (
+            <div
+              className="fixed top-0 right-0 z-50 h-full w-full max-w-2xl transform border-l border-slate-200 bg-white shadow-2xl transition-transform duration-300"
+            >
+              <div className="flex h-full flex-col overflow-y-auto p-6">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-[11px] uppercase tracking-[0.28em] text-slate-500">Create profile</p>
+                    <h1 className="text-2xl font-semibold text-slate-900">New profile</h1>
+                    <p className="text-sm text-slate-600">Provide display name and optional contact info.</p>
+                  </div>
+                  <button
+                    onClick={() => setAddOpen(false)}
+                    className="rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-700 hover:bg-slate-100"
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="mt-6 grid gap-3 md:grid-cols-2">
+                  <LabeledInput
+                    label="Display name*"
+                    value={createForm.displayName}
+                    onChange={(v) => setCreateForm((f) => ({ ...f, displayName: v }))}
+                  />
+                  <LabeledInput
+                    label="Email"
+                    value={createForm.email}
+                    onChange={(v) => setCreateForm((f) => ({ ...f, email: v }))}
+                  />
+                  <LabeledInput
+                    label="First name"
+                    value={createForm.firstName}
+                    onChange={(v) => setCreateForm((f) => ({ ...f, firstName: v }))}
+                  />
+                  <LabeledInput
+                    label="Last name"
+                    value={createForm.lastName}
+                    onChange={(v) => setCreateForm((f) => ({ ...f, lastName: v }))}
+                  />
+                </div>
+                <div className="mt-6 flex justify-end gap-2">
+                  <button
+                    onClick={() => setAddOpen(false)}
+                    className="rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-800 hover:bg-slate-100"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleCreateProfile}
+                    disabled={creatingDisabled}
+                    className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {createLoading ? "Creating..." : "Save profile"}
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
           <div
             className={`fixed top-0 right-0 z-40 h-full w-full max-w-2xl transform border-l border-slate-200 bg-white shadow-2xl transition-transform duration-300 ${
               detailOpen ? "translate-x-0" : "translate-x-full"
@@ -328,6 +525,55 @@ export default function ManagerProfilesPage() {
                   </div>
                 </div>
 
+                <div className="mt-4 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                  <div className="mb-3 flex flex-col gap-2 md:flex-row md:items-center md:justify-between">
+                    <div>
+                      <p className="text-[11px] uppercase tracking-[0.28em] text-slate-500">
+                        Assignment
+                      </p>
+                      <p className="text-sm text-slate-600">
+                        Link this profile to an active bidder.
+                      </p>
+                    </div>
+                    <div className="text-xs text-slate-500">
+                      {activeAssignment
+                        ? `Assigned since ${new Date(activeAssignment.assignedAt).toLocaleDateString()}`
+                        : "Unassigned"}
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2 md:flex-row md:items-center">
+                    <select
+                      value={assignBidderId}
+                      onChange={(e) => setAssignBidderId(e.target.value)}
+                      className="w-full md:w-auto rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-900 outline-none ring-1 ring-transparent focus:ring-slate-300"
+                    >
+                      {bidders.map((b) => (
+                        <option key={b.id} value={b.id}>
+                          {b.name} ({b.email})
+                        </option>
+                      ))}
+                    </select>
+                    <div className="flex gap-2">
+                      <button
+                        onClick={handleAssign}
+                        disabled={assignLoading || !assignBidderId}
+                        className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-semibold text-white transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+                      >
+                        {assignLoading ? "Saving..." : activeAssignment ? "Update" : "Assign"}
+                      </button>
+                      {activeAssignment && (
+                        <button
+                          onClick={() => handleUnassign(activeAssignment.id)}
+                          disabled={assignLoading}
+                          className="rounded-xl border border-slate-200 px-4 py-2 text-sm text-slate-800 hover:bg-slate-100 disabled:cursor-not-allowed disabled:opacity-60"
+                        >
+                          Unassign
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+
                 <div className="mt-6 grid gap-3 md:grid-cols-2">
                   {editing ? (
                     <>
@@ -358,7 +604,7 @@ export default function ManagerProfilesPage() {
                       />
                       <LabeledInput
                         label="Country"
-                        value={draft.location?.country ?? ""}
+                        value={draft.location?.country ?? "—"}
                         onChange={(v) => updateBase("location.country", v)}
                       />
                       <label className="flex items-center gap-2 rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800">
@@ -373,11 +619,11 @@ export default function ManagerProfilesPage() {
                     </>
                   ) : (
                     <>
-                      <ReadRow label="First name" value={draft.name?.first ?? "—"} />
-                      <ReadRow label="Last name" value={draft.name?.last ?? "—"} />
-                      <ReadRow label="Email" value={draft.contact?.email ?? "—"} />
-                      <ReadRow label="Phone" value={draft.contact?.phone ?? "—"} />
-                      <ReadRow label="City" value={draft.location?.city ?? "—"} />
+                      <ReadRow label="First name" value={draft.name?.first ?? "â€”"} />
+                      <ReadRow label="Last name" value={draft.name?.last ?? "â€”"} />
+                      <ReadRow label="Email" value={draft.contact?.email ?? "â€”"} />
+                      <ReadRow label="Phone" value={draft.contact?.phone ?? "â€”"} />
+                      <ReadRow label="City" value={draft.location?.city ?? "â€”"} />
                       <ReadRow label="Country" value={draft.location?.country ?? "—"} />
                       <ReadRow
                         label="Authorized to work"
@@ -408,17 +654,24 @@ export default function ManagerProfilesPage() {
                         No resumes yet.
                       </div>
                     ) : (
-                      resumes.map((r) => (
-                        <div
-                          key={r.id}
-                          className="flex items-center justify-between rounded-xl border border-slate-200 px-4 py-3 text-sm text-slate-800"
-                        >
-                          <div>
-                            <div className="font-semibold text-slate-900">{r.label}</div>
-                            <div className="text-xs text-slate-500">
-                              Added {new Date(r.createdAt).toLocaleDateString()}
-                            </div>
+                    resumes.map((r) => (
+                      <div
+                        key={r.id}
+                        className="flex items-center justify-between rounded-xl border border-slate-200 px-4 py-3 text-sm text-slate-800"
+                      >
+                        <button onClick={() => setViewResume(r)} className="text-left">
+                          <div className="font-semibold text-slate-900 underline">{r.label}</div>
+                          <div className="text-xs text-slate-500">
+                            Added {new Date(r.createdAt).toLocaleDateString()}
                           </div>
+                        </button>
+                        <div className="flex items-center gap-3">
+                          <button
+                            onClick={() => setViewResume(r)}
+                            className="rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-800 hover:bg-slate-100"
+                          >
+                            View
+                          </button>
                           <button
                             onClick={() => handleRemoveResume(r.id)}
                             disabled={savingResumeId === r.id}
@@ -427,13 +680,73 @@ export default function ManagerProfilesPage() {
                             {savingResumeId === r.id ? "Removing..." : "Remove"}
                           </button>
                         </div>
-                      ))
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+              </div>
+            ) : null}
+          </div>
+
+          {viewResume && (
+            <div
+              className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 px-4"
+              onClick={() => {
+                setViewResume(null);
+                if (viewUrl) URL.revokeObjectURL(viewUrl);
+                setViewUrl("");
+                setViewError("");
+              }}
+            >
+              <div
+                className="w-full max-w-5xl rounded-2xl border border-slate-200 bg-white p-6 shadow-2xl text-slate-900"
+                onClick={(e) => e.stopPropagation()}
+              >
+                <div className="flex items-center justify-between">
+                  <div>
+                    <p className="text-xs uppercase tracking-[0.18em] text-slate-500">Resume</p>
+                    <h2 className="text-xl font-semibold text-slate-900">{viewResume.label}</h2>
+                  </div>
+                  <button
+                    onClick={() => {
+                      setViewResume(null);
+                      if (viewUrl) URL.revokeObjectURL(viewUrl);
+                      setViewUrl("");
+                      setViewError("");
+                    }}
+                    className="rounded-full border border-slate-200 px-3 py-1 text-xs text-slate-700 hover:bg-slate-100"
+                  >
+                    Close
+                  </button>
+                </div>
+                <div className="mt-4 space-y-3">
+                  <div className="rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-slate-800">
+                    {viewResume.resumeText && viewResume.resumeText.trim()
+                      ? viewResume.resumeText
+                      : "No extracted text available for this resume."}
+                  </div>
+                  <div className="h-[520px] overflow-hidden rounded-xl border border-slate-200 bg-slate-50">
+                    {viewError ? (
+                      <div className="flex h-full items-center justify-center text-sm text-red-500">
+                        {viewError}
+                      </div>
+                    ) : viewUrl ? (
+                      <iframe
+                        src={viewUrl}
+                        className="h-full w-full bg-white"
+                        title={viewResume.label}
+                      />
+                    ) : (
+                      <div className="flex h-full items-center justify-center text-sm text-slate-600">
+                        Loading PDF...
+                      </div>
                     )}
                   </div>
                 </div>
               </div>
-            ) : null}
-          </div>
+            </div>
+          )}
 
           {detailOpen && (
             <div
@@ -444,10 +757,89 @@ export default function ManagerProfilesPage() {
               }}
             />
           )}
+          {addOpen && (
+            <div
+              className="fixed inset-0 z-40 bg-black/30"
+              onClick={() => setAddOpen(false)}
+            />
+          )}
         </section>
       </div>
     </ManagerShell>
   );
+
+  async function handleAssign() {
+    if (!selectedProfile || !assignBidderId || !token || !user) return;
+    setAssignLoading(true);
+    setError("");
+    try {
+      await api(
+        "/assignments",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            profileId: selectedProfile.id,
+            bidderUserId: assignBidderId,
+            assignedBy: user.id,
+          }),
+        },
+        token,
+      );
+      await loadAssignments(token);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to assign profile.");
+    } finally {
+      setAssignLoading(false);
+    }
+  }
+
+  async function handleCreateProfile() {
+    if (!token || !user) return;
+    if (!createForm.displayName.trim()) return;
+    setCreateLoading(true);
+    setError("");
+    try {
+      const created = await api<Profile>(
+        "/profiles",
+        {
+          method: "POST",
+          body: JSON.stringify({
+            displayName: createForm.displayName.trim(),
+            firstName: createForm.firstName.trim() || undefined,
+            lastName: createForm.lastName.trim() || undefined,
+            email: createForm.email.trim() || undefined,
+          }),
+        },
+        token,
+      );
+      await loadProfiles(token);
+      setSelectedId(created.id);
+      setDetailOpen(true);
+      setAddOpen(false);
+    } catch (err) {
+      console.error(err);
+      setError("Failed to create profile.");
+    } finally {
+      setCreateLoading(false);
+    }
+  }
+
+  async function handleUnassign(assignmentId: string) {
+    if (!token) return;
+    setAssignLoading(true);
+    setError("");
+    try {
+      await api(`/assignments/${assignmentId}/unassign`, { method: "POST", body: "{}" }, token);
+      await loadAssignments(token);
+      setAssignBidderId(bidders[0]?.id ?? "");
+    } catch (err) {
+      console.error(err);
+      setError("Failed to unassign profile.");
+    } finally {
+      setAssignLoading(false);
+    }
+  }
 
   function updateBase(path: string, value: string | boolean) {
     setDraftBase((prev) => {

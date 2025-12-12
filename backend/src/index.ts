@@ -3,29 +3,41 @@ import fastify from 'fastify';
 import cors from '@fastify/cors';
 import websocket from '@fastify/websocket';
 import { randomUUID } from 'crypto';
+import { promises as fs } from 'fs';
+import path from 'path';
+import fsSync from 'fs';
 import { z } from 'zod';
 import { chromium, Browser, Page } from 'playwright';
 import bcrypt from 'bcryptjs';
-import { assignments, events, llmSettings, profiles, resumes, sessions, profileResumes } from './data';
-import { ApplicationSession, BaseInfo, ProfileResume, SessionStatus, User, UserRole } from './types';
+import { events, llmSettings, sessions } from './data';
+import { ApplicationSession, BaseInfo, SessionStatus, User, UserRole } from './types';
 import { authGuard, forbidObserver, signToken } from './auth';
 import {
+  closeAssignmentById,
   deleteResumeById,
-  deleteProfileResume,
+  findActiveAssignmentByProfile,
+  findProfileById,
+  findResumeById,
   findUserByEmail,
   findUserById,
   initDb,
   insertProfile,
+  insertAssignmentRecord,
   insertResumeRecord,
-  insertProfileResumeRecord,
   insertUser,
+  listAssignments,
   listBidderSummaries,
+  listProfiles,
+  listProfilesForBidder,
+  listResumesByProfile,
   pool,
   updateProfileRecord,
 } from './db';
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
 const app = fastify({ logger: true });
+const PROJECT_ROOT = path.join(__dirname, '..');
+const RESUME_DIR = process.env.RESUME_DIR ?? path.join(PROJECT_ROOT, 'data', 'resumes');
 
 const livePages = new Map<
   string,
@@ -39,6 +51,7 @@ async function bootstrap() {
   await app.register(cors, { origin: true });
   await app.register(websocket);
   await initDb();
+  await fs.mkdir(RESUME_DIR, { recursive: true });
 
   app.get('/health', async () => ({ status: 'ok' }));
 
@@ -83,15 +96,18 @@ async function bootstrap() {
 
   app.get('/profiles', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
-    const userId = (request.query as { userId?: string }).userId;
-    if (!userId) return profiles;
-    const user = await findUserById(userId);
-    if (!user || !user.isActive) return [];
-    if (user.role === 'ADMIN' || user.role === 'MANAGER') return profiles;
-    const assignedProfileIds = assignments
-      .filter((a) => a.bidderUserId === userId && !a.unassignedAt)
-      .map((a) => a.profileId);
-    return profiles.filter((p) => assignedProfileIds.includes(p.id));
+    const actor = request.authUser;
+    const queryUserId = (request.query as { userId?: string }).userId;
+    const targetUser = actor ?? (queryUserId ? await findUserById(queryUserId) : undefined);
+    if (!targetUser || !targetUser.isActive) return [];
+
+    if (targetUser.role === 'ADMIN' || targetUser.role === 'MANAGER') {
+      return listProfiles();
+    }
+    if (targetUser.role === 'BIDDER') {
+      return listProfilesForBidder(targetUser.id);
+    }
+    return [];
   });
 
   app.post('/profiles', async (request, reply) => {
@@ -121,7 +137,6 @@ async function bootstrap() {
       createdAt: now,
       updatedAt: now,
     };
-    profiles.unshift(profile);
     await insertProfile(profile);
     return profile;
   });
@@ -133,8 +148,8 @@ async function bootstrap() {
       return reply.status(403).send({ message: 'Only managers or admins can update profiles' });
     }
     const { id } = request.params as { id: string };
-    const profile = profiles.find((p) => p.id === id);
-    if (!profile) return reply.status(404).send({ message: 'Profile not found' });
+    const existing = await findProfileById(id);
+    if (!existing) return reply.status(404).send({ message: 'Profile not found' });
 
     const schema = z.object({
       displayName: z.string().min(2).optional(),
@@ -144,34 +159,40 @@ async function bootstrap() {
 
     const incomingBase = (body.baseInfo ?? {}) as any;
     const mergedBase = {
-      ...profile.baseInfo,
+      ...(existing.baseInfo ?? {}),
       ...(incomingBase || {}),
-      name: { ...(profile.baseInfo?.name ?? {}), ...(incomingBase?.name ?? {}) },
-      contact: { ...(profile.baseInfo?.contact ?? {}), ...(incomingBase?.contact ?? {}) },
-      location: { ...(profile.baseInfo?.location ?? {}), ...(incomingBase?.location ?? {}) },
-      workAuth: { ...(profile.baseInfo?.workAuth ?? {}), ...(incomingBase?.workAuth ?? {}) },
-      links: { ...(profile.baseInfo?.links ?? {}), ...(incomingBase?.links ?? {}) },
+      name: { ...(existing.baseInfo?.name ?? {}), ...(incomingBase?.name ?? {}) },
+      contact: { ...(existing.baseInfo?.contact ?? {}), ...(incomingBase?.contact ?? {}) },
+      location: { ...(existing.baseInfo?.location ?? {}), ...(incomingBase?.location ?? {}) },
+      workAuth: { ...(existing.baseInfo?.workAuth ?? {}), ...(incomingBase?.workAuth ?? {}) },
+      links: { ...(existing.baseInfo?.links ?? {}), ...(incomingBase?.links ?? {}) },
       defaultAnswers: {
-        ...(profile.baseInfo?.defaultAnswers ?? {}),
+        ...(existing.baseInfo?.defaultAnswers ?? {}),
         ...(incomingBase?.defaultAnswers ?? {}),
       },
     };
 
-    profile.displayName = body.displayName ?? profile.displayName;
-    profile.baseInfo = mergedBase;
-    profile.updatedAt = new Date().toISOString();
+    const updatedProfile = {
+      ...existing,
+      displayName: body.displayName ?? existing.displayName,
+      baseInfo: mergedBase,
+      updatedAt: new Date().toISOString(),
+    };
 
-    await updateProfileRecord(profile);
-    return profile;
+    await updateProfileRecord({
+      id: updatedProfile.id,
+      displayName: updatedProfile.displayName,
+      baseInfo: updatedProfile.baseInfo,
+    });
+    return updatedProfile;
   });
 
   app.get('/profiles/:id/resumes', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
-    const profile = profiles.find((p) => p.id === id);
+    const profile = await findProfileById(id);
     if (!profile) return reply.status(404).send({ message: 'Profile not found' });
-    const resumeIds = profileResumes.filter((pr) => pr.profileId === id).map((pr) => pr.resumeId);
-    return resumes.filter((r) => resumeIds.includes(r.id));
+    return listResumesByProfile(id);
   });
 
   app.post('/profiles/:id/resumes', async (request, reply) => {
@@ -181,34 +202,46 @@ async function bootstrap() {
       return reply.status(403).send({ message: 'Only managers or admins can add resumes' });
     }
     const { id } = request.params as { id: string };
-    const profile = profiles.find((p) => p.id === id);
+    const profile = await findProfileById(id);
     if (!profile) return reply.status(404).send({ message: 'Profile not found' });
 
     const schema = z.object({
-      label: z.string().min(2),
+      label: z.string().optional(),
       filePath: z.string().optional(),
       fileData: z.string().optional(),
       fileName: z.string().optional(),
     });
     const body = schema.parse(request.body ?? {});
+    const baseLabel =
+      body.label?.trim() ||
+      (body.fileName ? body.fileName.replace(/\.[^/.]+$/, '').trim() : '') ||
+      '';
+    if (baseLabel.length < 2) {
+      return reply.status(400).send({ message: 'Label is required (min 2 chars)' });
+    }
+    if (!body.fileData && !body.filePath) {
+      return reply.status(400).send({ message: 'Resume file is required' });
+    }
+    const resumeId = randomUUID();
+    let filePath = body.filePath ?? '';
+    if (body.fileData) {
+      const buffer = Buffer.from(body.fileData, 'base64');
+      const ext =
+        body.fileName && path.extname(body.fileName) ? path.extname(body.fileName) : '.pdf';
+      const fileName = `${resumeId}${ext}`;
+      const targetPath = path.join(RESUME_DIR, fileName);
+      await fs.writeFile(targetPath, buffer);
+      filePath = `/data/resumes/${fileName}`;
+    }
     const resume = {
-      id: randomUUID(),
-      label: body.label,
-      filePath: body.fileName ?? body.filePath ?? '',
-      resumeText: body.fileData ?? '',
-      resumeJson: {},
-      createdAt: new Date().toISOString(),
-    };
-    resumes.unshift(resume);
-    await insertResumeRecord(resume);
-    const link: ProfileResume = {
-      id: randomUUID(),
+      id: resumeId,
       profileId: id,
-      resumeId: resume.id,
+      label: baseLabel,
+      filePath,
+      resumeText: '',
       createdAt: new Date().toISOString(),
     };
-    profileResumes.unshift(link);
-    await insertProfileResumeRecord(link);
+    await insertResumeRecord(resume);
     return resume;
   });
 
@@ -219,40 +252,65 @@ async function bootstrap() {
       return reply.status(403).send({ message: 'Only managers or admins can remove resumes' });
     }
     const { profileId, resumeId } = request.params as { profileId: string; resumeId: string };
-    const profile = profiles.find((p) => p.id === profileId);
+    const profile = await findProfileById(profileId);
     if (!profile) return reply.status(404).send({ message: 'Profile not found' });
-    const linkIdx = profileResumes.findIndex(
-      (pr) => pr.profileId === profileId && pr.resumeId === resumeId,
-    );
-    if (linkIdx === -1) return reply.status(404).send({ message: 'Resume not found' });
-    profileResumes.splice(linkIdx, 1);
-    const idx = resumes.findIndex((r) => r.id === resumeId);
-    if (idx !== -1) resumes.splice(idx, 1);
-    await deleteProfileResume(profileId, resumeId);
+    const resume = await findResumeById(resumeId);
+    if (!resume || resume.profileId !== profileId) {
+      return reply.status(404).send({ message: 'Resume not found' });
+    }
+    if (resume.filePath) {
+      try {
+        const resolved = resolveResumePath(resume.filePath);
+        if (resolved) await fs.unlink(resolved);
+      } catch {
+        // ignore missing files
+      }
+    }
     await deleteResumeById(resumeId);
     return { ok: true };
   });
 
+  app.get('/resumes/:id/file', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
+      return reply.status(403).send({ message: 'Only managers or admins can view resumes' });
+    }
+    const { id } = request.params as { id: string };
+    const resume = await findResumeById(id);
+    if (!resume || !resume.filePath) return reply.status(404).send({ message: 'Resume not found' });
+    const resolvedPath = resolveResumePath(resume.filePath);
+    if (!resolvedPath || !fsSync.existsSync(resolvedPath)) {
+      return reply.status(404).send({ message: 'File missing' });
+    }
+    reply.header('Content-Type', 'application/pdf');
+    const stream = fsSync.createReadStream(resolvedPath);
+    return reply.send(stream);
+  });
+
   app.get('/assignments', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
-    return assignments;
+    return listAssignments();
   });
   app.post('/assignments', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
+      return reply.status(403).send({ message: 'Only managers or admins can assign profiles' });
+    }
     const schema = z.object({
       profileId: z.string(),
       bidderUserId: z.string(),
-      assignedBy: z.string(),
+      assignedBy: z.string().optional(),
     });
     const body = schema.parse(request.body);
-    const profile = profiles.find((p) => p.id === body.profileId);
+    const profile = await findProfileById(body.profileId);
     const bidder = await findUserById(body.bidderUserId);
-    if (!bidder || bidder.role !== 'BIDDER') return reply.status(400).send({ message: 'Invalid profile or bidder' });
-    if (!profile || !bidder) return reply.status(400).send({ message: 'Invalid profile or bidder' });
+    if (!profile || !bidder || bidder.role !== 'BIDDER') {
+      return reply.status(400).send({ message: 'Invalid profile or bidder' });
+    }
 
-    const existing = assignments.find(
-      (a) => a.profileId === body.profileId && !a.unassignedAt,
-    );
+    const existing = await findActiveAssignmentByProfile(body.profileId);
     if (existing) {
       return reply
         .status(409)
@@ -263,11 +321,11 @@ async function bootstrap() {
       id: randomUUID(),
       profileId: body.profileId,
       bidderUserId: body.bidderUserId,
-      assignedBy: body.assignedBy,
+      assignedBy: actor.id ?? body.assignedBy ?? body.bidderUserId,
       assignedAt: new Date().toISOString(),
       unassignedAt: null as string | null,
     };
-    assignments.unshift(newAssignment);
+    await insertAssignmentRecord(newAssignment);
     events.push({
       id: randomUUID(),
       sessionId: 'admin-event',
@@ -281,9 +339,8 @@ async function bootstrap() {
   app.post('/assignments/:id/unassign', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
-    const assignment = assignments.find((a) => a.id === id && !a.unassignedAt);
+    const assignment = await closeAssignmentById(id);
     if (!assignment) return reply.status(404).send({ message: 'Assignment not found' });
-    assignment.unassignedAt = new Date().toISOString();
     events.push({
       id: randomUUID(),
       sessionId: 'admin-event',
@@ -311,9 +368,7 @@ async function bootstrap() {
       selectedResumeId: z.string().optional(),
     });
     const body = schema.parse(request.body);
-    const profileAssignment = assignments.find(
-      (a) => a.profileId === body.profileId && !a.unassignedAt,
-    );
+    const profileAssignment = await findActiveAssignmentByProfile(body.profileId);
     if (profileAssignment && profileAssignment.bidderUserId !== body.bidderUserId) {
       return reply.status(403).send({ message: 'Profile not assigned to bidder' });
     }
@@ -364,8 +419,8 @@ async function bootstrap() {
     const { id } = request.params as { id: string };
     const session = sessions.find((s) => s.id === id);
     if (!session) return reply.status(404).send({ message: 'Session not found' });
-    const profileResumes = resumes.filter((r) => r.profileId === session.profileId);
-    const recommended = profileResumes[0];
+    const profileResumesList = await listResumesByProfile(session.profileId);
+    const recommended = profileResumesList[0];
     session.recommendedResumeId = recommended?.id;
     session.status = 'ANALYZED';
     session.jobContext = {
@@ -382,7 +437,7 @@ async function bootstrap() {
     });
     return {
       recommendedResumeId: session.recommendedResumeId,
-      alternatives: profileResumes.map((r) => ({ id: r.id, label: r.label })),
+      alternatives: profileResumesList.map((r) => ({ id: r.id, label: r.label })),
       jobContext: session.jobContext,
     };
   });
@@ -392,7 +447,7 @@ async function bootstrap() {
     const { id } = request.params as { id: string };
     const session = sessions.find((s) => s.id === id);
     if (!session) return reply.status(404).send({ message: 'Session not found' });
-    const profile = profiles.find((p) => p.id === session.profileId);
+    const profile = await findProfileById(session.profileId);
     if (!profile) return reply.status(404).send({ message: 'Profile not found' });
     session.status = 'FILLED';
     session.fillPlan = buildDemoFillPlan(profile.baseInfo);
@@ -434,9 +489,21 @@ async function bootstrap() {
 
   app.get('/users', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
-    const { rows } = await pool.query<User>(
-      'SELECT id, email, name, role, is_active as "isActive" FROM users ORDER BY created_at ASC',
-    );
+    const { role } = request.query as { role?: string };
+    const roleFilter = role ? role.toUpperCase() : null;
+
+    const baseSql = `
+      SELECT id, email, name, role, is_active as "isActive"
+      FROM users
+      WHERE is_active = TRUE
+    `;
+
+    const sql = roleFilter
+      ? `${baseSql} AND role = $1 ORDER BY created_at ASC`
+      : `${baseSql} AND role <> 'OBSERVER' ORDER BY created_at ASC`;
+
+    const params = roleFilter ? [roleFilter] : [];
+    const { rows } = await pool.query<User>(sql, params);
     return rows;
   });
 
@@ -578,6 +645,26 @@ function buildDemoFillPlan(baseInfo: BaseInfo) {
     suggestions: [{ field: 'cover_letter', suggestion: 'Short note about relevant skills' }],
     blocked: ['EEO', 'veteran_status', 'disability'],
   };
+}
+
+function resolveResumePath(p: string) {
+  if (!p) return '';
+  if (path.isAbsolute(p)) {
+    // If an absolute path was previously stored, fall back to the shared resumes directory using the filename.
+    const fileName = path.basename(p);
+    return path.join(RESUME_DIR, fileName);
+  }
+  const normalized = p.replace(/\\/g, '/');
+  if (normalized.startsWith('/data/resumes/')) {
+    const fileName = normalized.split('/').pop() ?? '';
+    return path.join(RESUME_DIR, fileName);
+  }
+  if (normalized.startsWith('/resumes/')) {
+    const fileName = normalized.split('/').pop() ?? '';
+    return path.join(RESUME_DIR, fileName);
+  }
+  const trimmed = normalized.replace(/^\.?\\?\//, '');
+  return path.join(PROJECT_ROOT, trimmed);
 }
 
 bootstrap();

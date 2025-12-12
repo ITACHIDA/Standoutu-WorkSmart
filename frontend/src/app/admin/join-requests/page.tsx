@@ -28,8 +28,8 @@ export default function JoinRequestsPage() {
 
   async function loadObservers(authToken: string) {
     try {
-      const list = await api<ClientUser[]>("/users", undefined, authToken);
-      setObservers(list.filter((u) => u.role === "OBSERVER"));
+      const list = await api<ClientUser[]>("/users?role=OBSERVER", undefined, authToken);
+      setObservers(list);
     } catch (err) {
       console.error(err);
       setError("Failed to load join requests.");

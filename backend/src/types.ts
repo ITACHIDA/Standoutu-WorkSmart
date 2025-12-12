@@ -30,18 +30,10 @@ export interface Profile {
 
 export interface Resume {
   id: string;
-  profileId?: string;
+  profileId: string;
   label: string;
   filePath: string;
   resumeText?: string;
-  resumeJson?: Record<string, unknown>;
-  createdAt: string;
-}
-
-export interface ProfileResume {
-  id: string;
-  profileId: string;
-  resumeId: string;
   createdAt: string;
 }
 

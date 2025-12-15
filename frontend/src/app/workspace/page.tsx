@@ -58,6 +58,27 @@ type FillPlan = {
   blocked?: string[];
 };
 
+type PageFieldCandidate = {
+  field_id?: string;
+  id?: string | null;
+  name?: string | null;
+  label?: string | null;
+  ariaName?: string | null;
+  placeholder?: string | null;
+  questionText?: string | null;
+  type?: string | null;
+  selector?: string | null;
+  locators?: { css?: string; playwright?: string };
+  constraints?: Record<string, number>;
+  required?: boolean;
+};
+
+type AutofillResponse = {
+  fillPlan: FillPlan;
+  pageFields?: PageFieldCandidate[];
+  candidateFields?: PageFieldCandidate[];
+};
+
 type AnalyzeResult = {
   recommendedResumeId?: string;
   alternatives?: { id: string; label: string }[];
@@ -65,7 +86,13 @@ type AnalyzeResult = {
   ranked?: { id: string; label: string; rank: number; score?: number }[];
   recommendedLabel?: string;
   scores?: Record<string, number>;
+  mode?: "tech" | "resume";
+  techStacks?: { label: string; score?: number }[];
 };
+
+type AnalyzePopupState =
+  | { mode: "tech"; items: { label: string; score?: number }[] }
+  | { mode: "resume"; items: { id: string; label: string; score?: number }[] };
 
 type Metrics = {
   tried: number;
@@ -118,19 +145,22 @@ export default function Page() {
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [recommended, setRecommended] = useState<AnalyzeResult | null>(null);
   const [fillPlan, setFillPlan] = useState<FillPlan | null>(null);
+  const [capturedFields, setCapturedFields] = useState<PageFieldCandidate[]>([]);
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [streamFrame, setStreamFrame] = useState<string>("");
   const [status, setStatus] = useState<string>("Disconnected");
   const [error, setError] = useState<string>("");
   const [loadingAction, setLoadingAction] = useState<string>("");
   const [streamConnected, setStreamConnected] = useState(false);
-  const [analyzePopup, setAnalyzePopup] = useState<{ items: { label: string; score?: number }[] } | null>(null);
+  const [analyzePopup, setAnalyzePopup] = useState<AnalyzePopupState | null>(null);
+  const [useAiAnalyze, setUseAiAnalyze] = useState(false);
   const [editingBaseInfo, setEditingBaseInfo] = useState(false);
   const [draftBaseInfo, setDraftBaseInfo] = useState<BaseInfo>({});
   const [webviewStatus, setWebviewStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle");
   const webviewRef = useRef<Element | null>(null);
   const [isClient, setIsClient] = useState(false);
   const router = useRouter();
+  const isBidder = user?.role === "BIDDER";
   const browserSrc = session?.url || url || "";
   const webviewPartition = "persist:smartwork-jobview";
 
@@ -167,12 +197,15 @@ export default function Page() {
 
   const appliedPct = metrics ? `${metrics.appliedPercentage}%` : "0%";
   const monthlyApplied = metrics?.monthlyApplied ?? 0;
+  const filledFields = fillPlan?.filled ?? [];
+  const fillSuggestions = fillPlan?.suggestions ?? [];
+  const fillBlocked = fillPlan?.blocked ?? [];
 
   async function loadResumes(profileId: string) {
     try {
       const data: Resume[] = await api(`/profiles/${profileId}/resumes`);
       setResumes(data);
-      if (data[0]) setResumeChoice(data[0].id);
+      setResumeChoice("");
     } catch (err) {
       console.error(err);
     }
@@ -198,6 +231,7 @@ export default function Page() {
     void loadResumes(selectedProfileId);
     setSession(null);
     setFillPlan(null);
+    setCapturedFields([]);
     setRecommended(null);
     setStreamFrame("");
     setStreamConnected(false);
@@ -299,9 +333,29 @@ export default function Page() {
     try {
       const res = await api(`/sessions/${session.id}/analyze`, {
         method: "POST",
+        body: JSON.stringify({ useAi: useAiAnalyze }),
       });
       const result = res as AnalyzeResult;
       setRecommended(result);
+      const mode = result.mode ?? (useAiAnalyze ? "resume" : "tech");
+
+      if (mode === "tech") {
+        const techItems =
+          (result.techStacks?.length ? result.techStacks : result.ranked ?? []).slice(0, 4).map((t) => ({
+            label: t.label,
+            score: t.score,
+          })) ?? [];
+        if (techItems.length) {
+          setAnalyzePopup({ mode: "tech", items: techItems });
+        }
+        setSession({
+          ...session,
+          status: "ANALYZED",
+          jobContext: result.jobContext ?? session.jobContext,
+        });
+        return;
+      }
+
       if (result.recommendedResumeId) {
         setResumeChoice(result.recommendedResumeId);
       } else if (result.recommendedLabel) {
@@ -313,8 +367,8 @@ export default function Page() {
       if (result.ranked?.length) {
         const top = result.ranked.slice(0, 4);
         if (top.length) {
-          const items = top.map((r) => ({ label: r.label, score: r.score }));
-          setAnalyzePopup({ items });
+          const items = top.map((r) => ({ id: r.id ?? r.label, label: r.label, score: r.score }));
+          setAnalyzePopup({ mode: "resume", items });
         }
       }
       setSession({
@@ -335,12 +389,18 @@ export default function Page() {
     if (!session) return;
     setLoadingAction("autofill");
     setError("");
+    setCapturedFields([]);
     try {
-      const res = await api(`/sessions/${session.id}/autofill`, {
+      const res = (await api(`/sessions/${session.id}/autofill`, {
         method: "POST",
         body: JSON.stringify({ selectedResumeId: resumeChoice || undefined }),
-      });
+      })) as AutofillResponse;
       setFillPlan(res.fillPlan);
+      const detected =
+        (res.pageFields?.length ? res.pageFields : undefined) ??
+        (res.candidateFields?.length ? res.candidateFields : []) ??
+        [];
+      setCapturedFields(detected);
       setSession({
         ...session,
         status: "FILLED",
@@ -393,8 +453,12 @@ export default function Page() {
       if (!user || user.role === "OBSERVER") return;
       try {
         const profs: Profile[] = await api(`/profiles?userId=${user.id}`);
-        setProfiles(profs);
-        const defaultProfileId = profs[0]?.id ?? "";
+        const visible =
+          user.role === "BIDDER"
+            ? profs.filter((p: any) => p.assignedBidderId === user.id)
+            : profs;
+        setProfiles(visible);
+        const defaultProfileId = visible[0]?.id ?? "";
         setSelectedProfileId(defaultProfileId);
         void refreshMetrics(user.id);
         if (defaultProfileId) {
@@ -489,17 +553,23 @@ export default function Page() {
                   {user?.email ?? "Offline"}
                 </span>
               </div>
-              <select
-                value={selectedProfileId}
-                onChange={(e) => setSelectedProfileId(e.target.value)}
-                className="w-full rounded-xl bg-slate-100 px-3 py-2 text-sm text-slate-900 outline-none ring-1 ring-white/10"
-              >
-                {profiles.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.displayName}
-                  </option>
-                ))}
-              </select>
+              {isBidder ? (
+                <div className="w-full rounded-xl bg-slate-100 px-3 py-2 text-sm text-slate-900">
+                  {selectedProfile?.displayName ?? "Assigned profile"}
+                </div>
+              ) : (
+                <select
+                  value={selectedProfileId}
+                  onChange={(e) => setSelectedProfileId(e.target.value)}
+                  className="w-full rounded-xl bg-slate-100 px-3 py-2 text-sm text-slate-900 outline-none ring-1 ring-white/10"
+                >
+                  {profiles.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {p.displayName}
+                    </option>
+                  ))}
+                </select>
+              )}
               <p className="text-xs text-slate-700">Role: {user?.role ?? "Unknown"}</p>
             </div>
 
@@ -675,16 +745,32 @@ export default function Page() {
 
           {/* Right column 25% */}
           <section className="flex flex-col gap-4">
-              <div className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3">
-                <div className="flex items-center justify-between">
+            <div className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3">
+              <div className="flex items-center justify-between gap-3">
+                <div>
                   <p className="text-sm font-semibold">Analyse</p>
-                  <span className="text-[11px] text-slate-700">Pick best resume</span>
+                  <span className="text-[11px] text-slate-700">
+                    {useAiAnalyze ? "AI compares resumes" : "Detect tech stack only"}
+                  </span>
                 </div>
                 <button
-                  onClick={handleAnalyze}
-                  disabled={!session || loadingAction === "analyze"}
-                  className="w-full rounded-xl bg-[#4ade80] px-4 py-2 text-sm font-semibold text-[#0b1224] shadow-[0_14px_40px_-18px_rgba(94,243,197,0.8)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+                  type="button"
+                  onClick={() => setUseAiAnalyze((v) => !v)}
+                  className="flex items-center gap-2 rounded-full border border-slate-200 bg-white px-2 py-1 text-[11px] font-semibold text-slate-800 transition"
                 >
+                  <span className={`flex h-5 w-10 items-center rounded-full ${useAiAnalyze ? "bg-[#5ef3c5]" : "bg-slate-200"}`}>
+                    <span
+                      className={`h-4 w-4 rounded-full bg-white shadow transition ${useAiAnalyze ? "translate-x-5" : "translate-x-1"}`}
+                    />
+                  </span>
+                  {useAiAnalyze ? "On" : "Off"}
+                </button>
+              </div>
+              <button
+                onClick={handleAnalyze}
+                disabled={!session || loadingAction === "analyze"}
+                className="w-full rounded-xl bg-[#4ade80] px-4 py-2 text-sm font-semibold text-[#0b1224] shadow-[0_14px_40px_-18px_rgba(94,243,197,0.8)] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+              >
                   {loadingAction === "analyze" ? "Analysing..." : "Run analyse"}
                 </button>
                 <div className="rounded-xl border border-slate-200 bg-slate-100 px-3 py-3 space-y-2">
@@ -696,17 +782,26 @@ export default function Page() {
                       : "None"}
                   </span>
                 </div>
-                <select
-                  value={resumeChoice}
-                  onChange={(e) => setResumeChoice(e.target.value)}
-                  className="w-full rounded-lg bg-slate-100 px-3 py-2 text-sm text-slate-900 outline-none ring-1 ring-white/10"
-                >
-                  {resumes.map((r) => (
-                    <option key={r.id} value={r.id}>
-                      {r.label}
-                    </option>
-                  ))}
-                </select>
+                <div className="space-y-1">
+                  <label className="text-[11px] text-slate-600">Manual select</label>
+                  <select
+                    value={resumeChoice}
+                    onChange={(e) => setResumeChoice(e.target.value)}
+                    className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none"
+                  >
+                    <option value="">None</option>
+                    {resumes.map((r) => (
+                      <option key={r.id} value={r.id}>
+                        {r.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <p className="text-[11px] text-slate-600">
+                  {useAiAnalyze
+                    ? "AI mode ranks resumes and lets you pick from cards."
+                    : "Off mode lists top tech stack from the job description."}
+                </p>
               </div>
             </div>
 
@@ -722,48 +817,95 @@ export default function Page() {
               >
                 {loadingAction === "autofill" ? "Filling..." : "Autofill"}
               </button>
-              <div className="space-y-2 rounded-xl bg-slate-100 px-3 py-3 text-sm text-slate-800">
-                <div className="flex items-center justify-between">
-                  <span className="text-slate-800">Filled</span>
-                  <span className="text-xs text-[#5ef3c5]">
-                    {fillPlan?.filled?.length ?? 0}
-                  </span>
-                </div>
-                <div className="space-y-1 text-xs text-slate-700">
-                  {fillPlan?.filled?.map((f) => (
-                    <div key={f.field} className="flex items-center justify-between">
-                      <span>{f.field}</span>
-                      <span className="text-[#5ef3c5]">{f.value}</span>
-                    </div>
-                  )) || <div>No fields filled yet.</div>}
-                </div>
-                {fillPlan?.suggestions?.length ? (
-                  <div className="pt-2">
-                    <div className="text-xs text-slate-800">Needs review</div>
-                    <div className="space-y-1 text-xs text-slate-700">
-                      {fillPlan.suggestions.map((s) => (
-                        <div key={s.field}>
-                          {s.field}: {s.suggestion}
+              <div className="space-y-3">
+                <div className="space-y-2 rounded-xl bg-slate-100 px-3 py-3 text-sm text-slate-800">
+                  <div className="flex items-center justify-between">
+                    <span className="text-slate-800">Filled</span>
+                    <span className="text-xs text-[#5ef3c5]">
+                      {filledFields.length}
+                    </span>
+                  </div>
+                  <div className="space-y-1 text-xs text-slate-700">
+                    {filledFields.length ? (
+                      filledFields.map((f) => (
+                        <div key={f.field} className="flex items-center justify-between">
+                          <span>{f.field}</span>
+                          <span className="text-[#5ef3c5]">{f.value}</span>
                         </div>
-                      ))}
-                    </div>
+                      ))
+                    ) : (
+                      <div>No fields filled yet.</div>
+                    )}
                   </div>
-                ) : null}
-                {fillPlan?.blocked?.length ? (
-                  <div className="pt-2">
-                    <div className="text-xs text-red-300">Blocked</div>
-                    <div className="flex flex-wrap gap-1 text-[11px] text-red-200">
-                      {fillPlan.blocked.map((b) => (
-                        <span
-                          key={b}
-                          className="rounded-full bg-red-500/10 px-2 py-1"
-                        >
-                          {b}
-                        </span>
-                      ))}
+                  {fillSuggestions.length ? (
+                    <div className="pt-2">
+                      <div className="text-xs text-slate-800">Needs review</div>
+                      <div className="space-y-1 text-xs text-slate-700">
+                        {fillSuggestions.map((s) => (
+                          <div key={s.field}>
+                            {s.field}: {s.suggestion}
+                          </div>
+                        ))}
+                      </div>
                     </div>
+                  ) : null}
+                  {fillBlocked.length ? (
+                    <div className="pt-2">
+                      <div className="text-xs text-red-300">Blocked</div>
+                      <div className="flex flex-wrap gap-1 text-[11px] text-red-200">
+                        {fillBlocked.map((b) => (
+                          <span
+                            key={b}
+                            className="rounded-full bg-red-500/10 px-2 py-1"
+                          >
+                            {b}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                </div>
+                <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-xs text-slate-700">
+                  <div className="flex items-center justify-between">
+                    <span className="text-sm font-semibold text-slate-800">Captured fields</span>
+                    <span className="rounded-full bg-white px-3 py-1 text-[11px] text-slate-700">
+                      {capturedFields.length}
+                    </span>
                   </div>
-                ) : null}
+                  {capturedFields.length ? (
+                    <div className="mt-2 max-h-56 space-y-1 overflow-auto">
+                      {capturedFields.slice(0, 50).map((f, idx) => {
+                        const title =
+                          f.questionText || f.label || f.placeholder || f.field_id || `Field ${idx + 1}`;
+                        const metaParts = [
+                          f.type,
+                          f.required ? "required" : null,
+                          f.selector || f.locators?.css,
+                        ].filter((v): v is string => Boolean(v));
+                        const meta = metaParts.join(" · ");
+                        return (
+                          <div
+                            key={`${f.field_id ?? f.selector ?? f.name ?? f.label ?? idx}-${idx}`}
+                            className="rounded-lg bg-white px-2 py-1"
+                          >
+                            <div className="text-[12px] font-semibold text-slate-900">
+                              {title}
+                            </div>
+                            {meta ? (
+                              <div className="text-[11px] text-slate-600">
+                                {meta}
+                              </div>
+                            ) : null}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : (
+                    <div className="mt-2 text-[11px] text-slate-600">
+                      Click Autofill to capture the fields we detected on the page.
+                    </div>
+                  )}
+                </div>
               </div>
             </div>
 
@@ -894,10 +1036,12 @@ export default function Page() {
       </div>
     </main>
     {analyzePopup ? (
-      <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/5 pt-10">
-        <div className="w-[380px] rounded-3xl border border-slate-200 bg-white/95 px-5 py-4 shadow-2xl backdrop-blur">
+      <div className="fixed inset-0 z-50 flex items-start justify-center bg-black/10 pt-10 backdrop-blur-sm transition">
+        <div className="w-full max-w-2xl rounded-3xl border border-slate-200 bg-white/95 px-6 py-5 shadow-2xl backdrop-blur animate-fade-in">
           <div className="flex items-center justify-between pb-2">
-            <div className="text-base font-semibold text-slate-900">Analysis result</div>
+            <div className="text-base font-semibold text-slate-900">
+              {analyzePopup.mode === "tech" ? "Top tech stack" : "Resume picks"}
+            </div>
             <button
               onClick={() => setAnalyzePopup(null)}
               className="rounded-full px-3 py-1 text-xs font-medium text-slate-500 transition hover:bg-slate-100"
@@ -905,34 +1049,102 @@ export default function Page() {
               Close
             </button>
           </div>
-          <div className="space-y-2">
-            {analyzePopup.items.map((item, idx) => {
-              const rankLabel = idx === 0 ? "1st" : idx === 1 ? "2nd" : idx === 2 ? "3rd" : `${idx + 1}th`;
-              const isTop = idx === 0;
-              return (
-                <div
-                  key={`${item.label}-${idx}`}
-                  className={`flex items-center justify-between rounded-2xl px-4 py-3 ${
-                    isTop ? "bg-slate-900 text-white shadow-md" : "bg-slate-50 text-slate-800"
-                  }`}
-                >
-                  <div className={`font-semibold ${isTop ? "text-lg" : "text-sm"}`}>
-                    {rankLabel}: {item.label}
-                  </div>
-                  {typeof item.score !== "undefined" ? (
-                    <div className={`${isTop ? "text-sm text-slate-100" : "text-xs text-slate-600"}`}>
-                      score: {Number.isFinite(item.score) ? item.score.toFixed(2) : String(item.score)}
+          <div className="space-y-3">
+            {analyzePopup.mode === "tech" ? (
+              <div className="space-y-3">
+                {analyzePopup.items[0] ? (
+                  <div className="rounded-2xl border border-slate-200 bg-gradient-to-br from-white via-slate-50 to-[#e8fff4] px-5 py-5 shadow-sm">
+                    <div className="flex items-center justify-between gap-4">
+                      <div className="space-y-1">
+                        <div className="text-lg font-semibold text-slate-900">Top Result</div>
+                        <div className="text-sm text-slate-700">Job description focus</div>
+                      </div>
+                      <div className="text-4xl font-bold text-slate-900">{analyzePopup.items[0].label}</div>
                     </div>
+                    <div className="mt-4 text-sm text-slate-700">
+                      score: {formatScore(analyzePopup.items[0].score)}
+                    </div>
+                  </div>
+                ) : null}
+                <div className="space-y-2">
+                  {analyzePopup.items.slice(1).map((item, idx) => (
+                    <div
+                      key={`${item.label}-${idx}`}
+                      className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-4 py-3"
+                    >
+                      <div className="text-sm font-semibold text-slate-900">
+                        {ordinal(idx + 2)}: {item.label}
+                      </div>
+                      <div className="text-xs text-slate-600">score: {formatScore(item.score)}</div>
+                    </div>
+                  ))}
+                  {analyzePopup.items.length < 2 ? (
+                    <div className="text-xs text-slate-600">Not enough signals to show more stacks.</div>
                   ) : null}
                 </div>
-              );
-            })}
+              </div>
+            ) : (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {analyzePopup.items.map((item, idx) => {
+                  const rankLabel = ordinal(idx + 1);
+                  const isTop = idx === 0;
+                  return (
+                    <button
+                      key={`${item.id}-${idx}`}
+                      onClick={() => {
+                        setResumeChoice(item.id);
+                        setAnalyzePopup(null);
+                      }}
+                      className={`group relative flex h-full flex-col justify-between rounded-2xl border px-4 py-4 text-left transition duration-150 ${
+                        isTop
+                          ? "border-slate-900 bg-slate-900 text-white shadow-lg"
+                          : "border-slate-200 bg-white hover:-translate-y-1 hover:shadow"
+                      }`}
+                    >
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="text-sm font-semibold leading-tight">
+                          {rankLabel}: {item.label}
+                        </div>
+                        <div
+                          className={`rounded-full px-2 py-1 text-[11px] font-semibold ${
+                            isTop ? "bg-[#5ef3c5] text-slate-900" : "bg-slate-100 text-slate-700"
+                          }`}
+                        >
+                          Score {formatScore(item.score)}
+                        </div>
+                      </div>
+                      <div className={`mt-3 text-xs ${isTop ? "text-slate-100" : "text-slate-600"}`}>
+                        Click to select this resume automatically.
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
           </div>
         </div>
       </div>
     ) : null}
     </>
   );
+}
+
+function formatScore(score?: number) {
+  if (typeof score === "number" && Number.isFinite(score)) {
+    return score.toFixed(2);
+  }
+  if (typeof score === "number") return String(score);
+  return "N/A";
+}
+
+function ordinal(n: number) {
+  const mod100 = n % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${n}th`;
+  const mod10 = n % 10;
+  if (mod10 === 1) return `${n}st`;
+  if (mod10 === 2) return `${n}nd`;
+  if (mod10 === 3) return `${n}rd`;
+  return `${n}th`;
 }
 
 function StatTile({

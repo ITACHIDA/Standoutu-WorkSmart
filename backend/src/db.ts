@@ -24,6 +24,9 @@ export async function initDb() {
         display_name TEXT NOT NULL,
         base_info JSONB DEFAULT '{}'::jsonb,
         created_by UUID,
+        assigned_bidder_id UUID REFERENCES users(id),
+        assigned_by UUID REFERENCES users(id),
+        assigned_at TIMESTAMP,
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
@@ -80,6 +83,13 @@ export async function initDb() {
 
       ALTER TABLE IF EXISTS resumes
         ADD COLUMN IF NOT EXISTS resume_description TEXT;
+
+      ALTER TABLE IF EXISTS profiles
+        ADD COLUMN IF NOT EXISTS assigned_bidder_id UUID REFERENCES users(id);
+      ALTER TABLE IF EXISTS profiles
+        ADD COLUMN IF NOT EXISTS assigned_by UUID REFERENCES users(id);
+      ALTER TABLE IF EXISTS profiles
+        ADD COLUMN IF NOT EXISTS assigned_at TIMESTAMP;
 
       DROP TABLE IF EXISTS assignments;
     `);
@@ -150,6 +160,9 @@ export async function listProfiles(): Promise<Profile[]> {
         display_name AS "displayName",
         base_info AS "baseInfo",
         created_by AS "createdBy",
+        assigned_bidder_id AS "assignedBidderId",
+        assigned_by AS "assignedBy",
+        assigned_at AS "assignedAt",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
       FROM profiles
@@ -160,8 +173,25 @@ export async function listProfiles(): Promise<Profile[]> {
 }
 
 export async function listProfilesForBidder(bidderUserId: string): Promise<Profile[]> {
-  // Assignments removed: return all profiles for bidders.
-  return listProfiles();
+  const { rows } = await pool.query<Profile>(
+    `
+      SELECT
+        id,
+        display_name AS "displayName",
+        base_info AS "baseInfo",
+        created_by AS "createdBy",
+        assigned_bidder_id AS "assignedBidderId",
+        assigned_by AS "assignedBy",
+        assigned_at AS "assignedAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM profiles
+      WHERE assigned_bidder_id = $1
+      ORDER BY created_at DESC
+    `,
+    [bidderUserId],
+  );
+  return rows;
 }
 
 export async function findProfileById(id: string): Promise<Profile | undefined> {
@@ -172,6 +202,9 @@ export async function findProfileById(id: string): Promise<Profile | undefined> 
         display_name AS "displayName",
         base_info AS "baseInfo",
         created_by AS "createdBy",
+        assigned_bidder_id AS "assignedBidderId",
+        assigned_by AS "assignedBy",
+        assigned_at AS "assignedAt",
         created_at AS "createdAt",
         updated_at AS "updatedAt"
       FROM profiles
@@ -238,28 +271,79 @@ export async function findResumeById(resumeId: string): Promise<Resume | undefin
   return rows[0];
 }
 
-export async function updateResumeParsed(resumeId: string, opts: { resumeText?: string; resumeJson?: Record<string, unknown> }) {
-  // resume_json removed; keep text only
-  await pool.query('UPDATE resumes SET resume_text = $2 WHERE id = $1', [resumeId, opts.resumeText ?? null]);
-}
-
 export async function listAssignments(): Promise<Assignment[]> {
-  // Assignments table removed.
-  return [];
+  const { rows } = await pool.query<Assignment>(
+    `
+      SELECT
+        id AS "id",
+        id AS "profileId",
+        assigned_bidder_id AS "bidderUserId",
+        assigned_by AS "assignedBy",
+        assigned_at AS "assignedAt",
+        NULL::TIMESTAMP AS "unassignedAt"
+      FROM profiles
+      WHERE assigned_bidder_id IS NOT NULL
+      ORDER BY assigned_at DESC
+    `,
+  );
+  return rows;
 }
 
 export async function findActiveAssignmentByProfile(
   profileId: string,
 ): Promise<Assignment | undefined> {
-  return undefined;
+  const { rows } = await pool.query<Assignment>(
+    `
+      SELECT
+        id AS "id",
+        id AS "profileId",
+        assigned_bidder_id AS "bidderUserId",
+        assigned_by AS "assignedBy",
+        assigned_at AS "assignedAt",
+        NULL::TIMESTAMP AS "unassignedAt"
+      FROM profiles
+      WHERE id = $1 AND assigned_bidder_id IS NOT NULL
+      LIMIT 1
+    `,
+    [profileId],
+  );
+  return rows[0];
 }
 
 export async function insertAssignmentRecord(assignment: Assignment) {
-  // Assignments table removed.
+  await pool.query(
+    `
+      UPDATE profiles
+      SET assigned_bidder_id = $2,
+          assigned_by = $3,
+          assigned_at = $4,
+          updated_at = NOW()
+      WHERE id = $1
+    `,
+    [assignment.profileId, assignment.bidderUserId, assignment.assignedBy, assignment.assignedAt],
+  );
 }
 
 export async function closeAssignmentById(id: string): Promise<Assignment | undefined> {
-  return undefined;
+  const { rows } = await pool.query<Assignment>(
+    `
+      UPDATE profiles
+      SET assigned_bidder_id = NULL,
+          assigned_by = NULL,
+          assigned_at = NULL,
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING
+        id AS "id",
+        id AS "profileId",
+        NULL::UUID AS "bidderUserId",
+        NULL::UUID AS "assignedBy",
+        NULL::TIMESTAMP AS "assignedAt",
+        NULL::TIMESTAMP AS "unassignedAt"
+    `,
+    [id],
+  );
+  return rows[0];
 }
 
 export type BidderSummary = {

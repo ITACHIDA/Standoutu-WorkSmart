@@ -1,6 +1,8 @@
 import { randomUUID } from 'crypto';
 import { buildAutofillPlanPrompt, buildJobAnalyzePrompt, buildRankResumesPrompt, buildResumeParsePrompt } from './promptPack';
 
+type RankedResume = { id?: string; label: string; score: number };
+
 const LABELS = [
   'Golang',
   'Java',
@@ -123,7 +125,7 @@ const TITLE_KEYWORDS: Record<string, RegExp[]> = {
 const JAVASCRIPT_PATTERN = /\bjavascript\b/i;
 
 const HF_TOKEN = process.env.HF_TOKEN || process.env.HUGGINGFACEHUB_API_TOKEN;
-const HF_MODEL = 'mistralai/Mistral-7B-Instruct-v0.3';
+const HF_MODEL = 'meta-llama/Meta-Llama-3-8B-Instruct';
 
 type ScoreMap = Record<string, number>;
 
@@ -228,27 +230,26 @@ function classify(title: string | undefined, text: string) {
 async function callHuggingFace(prompt: string): Promise<string | undefined> {
   if (!HF_TOKEN) return undefined;
   try {
-    const res = await fetch(`https://api-inference.huggingface.co/models/${HF_MODEL}`, {
+    const res = await fetch('https://router.huggingface.co/v1/chat/completions', {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${HF_TOKEN}`,
         'Content-Type': 'application/json',
       },
       body: JSON.stringify({
-        inputs: prompt,
-        parameters: {
-          max_new_tokens: 512,
-          temperature: 0.1,
-          repetition_penalty: 1.05,
-          return_full_text: false,
-          stop: ['\n\n'],
-        },
+        model: HF_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 256,
+        temperature: 0.1,
       }),
     });
-    const data = (await res.json()) as { generated_text?: string }[] | { error?: string };
-    if (Array.isArray(data) && data[0]?.generated_text) {
-      return data[0].generated_text.trim();
-    }
+    const data = (await res.json()) as any;
+    const content =
+      data?.choices?.[0]?.message?.content ||
+      (Array.isArray(data) && data[0]?.generated_text) ||
+      data?.generated_text ||
+      data?.text;
+    if (typeof content === 'string') return content.trim();
   } catch {
     // ignore HF errors
   }
@@ -275,67 +276,30 @@ export const promptBuilders = {
 export async function analyzeJobFromUrl(
   url: string,
   resumesInput?: { id: string; label: string; parsed?: Record<string, unknown>; resume_text?: string }[],
-) {
+): Promise<{
+  id: string;
+  recommendedLabel?: string;
+  recommendedResumeId?: string;
+  ranked: RankedResume[];
+  rawScores: Record<string, number>;
+  title: string;
+  jobText: string;
+}> {
   const { text, title } = await fetchJobText(url);
-  const resumes = (resumesInput ?? []).map((r) => ({
-    id: r.id,
+
+  const classified = classify(title, text);
+  const ranked: RankedResume[] = classified.ranked.map((r) => ({
+    id: r.label,
     label: r.label,
-    parsed: r.parsed ?? {},
-    resume_text: r.resume_text ?? '',
+    score: Number.isFinite(r.score) ? Number(r.score) : 0,
   }));
-
-  let rankedFromLlm: { id?: string; label: string; score: number }[] | undefined;
-  const rankPrompt = buildRankResumesPrompt({
-    job: {
-      job_title: title ?? '',
-      company: '',
-      job_location_text: '',
-      job_description_text: text.slice(0, 6000),
-    },
-    resumes,
-  });
-  const hfJson = await callHuggingFace(rankPrompt);
-  if (hfJson) {
-    try {
-      const parsed = JSON.parse(hfJson);
-      const items = parsed?.result?.ranking ?? parsed?.ranked ?? [];
-      if (Array.isArray(items) && items.length) {
-        rankedFromLlm = items
-          .map((i: any) => ({
-            id: i.resume_id ?? i.id,
-            label: i.label ?? i.resume_label ?? i.id ?? '',
-            score: typeof i.total_score === 'number' ? i.total_score : i.score ?? 0,
-          }))
-          .filter((i) => i.label);
-        rankedFromLlm.sort((a, b) => b.score - a.score);
-      }
-    } catch {
-      // ignore parse errors
-    }
-  }
-
-  const { best, scores, ranked } = classify(title, text);
-  const fallbackRanked =
-    resumes.length > 0
-      ? resumes
-          .map((r, idx) => ({
-            id: r.id,
-            label: r.label,
-            score: scores[r.label] ?? ranked.length - idx,
-          }))
-          .sort((a, b) => b.score - a.score)
-      : ranked.map((r, idx) => ({ label: r.label, score: r.score ?? ranked.length - idx }));
-  const finalRanked = rankedFromLlm ?? fallbackRanked;
-  const recommended = finalRanked[0] ?? fallbackRanked[0];
-  const recommendedResumeId =
-    recommended?.id ?? resumesInput?.find((r) => r.label.toLowerCase() === (recommended?.label ?? '').toLowerCase())?.id;
 
   return {
     id: randomUUID(),
-    recommendedLabel: recommended?.label ?? best,
-    recommendedResumeId,
-    ranked: finalRanked,
-    rawScores: scores,
+    recommendedLabel: classified.best,
+    recommendedResumeId: undefined,
+    ranked,
+    rawScores: classified.scores,
     title: title ?? '',
     jobText: text,
   };

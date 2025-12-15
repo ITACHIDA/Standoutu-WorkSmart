@@ -7,12 +7,12 @@ import { promises as fs } from 'fs';
 import path from 'path';
 import fsSync from 'fs';
 import { z } from 'zod';
-import { chromium, Browser, Page } from 'playwright';
+import { chromium, Browser, Page, Frame } from 'playwright';
 import bcrypt from 'bcryptjs';
 import pdfParse from 'pdf-parse';
 import { extractRawText } from 'mammoth';
 import { events, llmSettings, sessions } from './data';
-import { ApplicationSession, BaseInfo, Resume, SessionStatus, User, UserRole } from './types';
+import { ApplicationSession, Assignment, BaseInfo, Resume, SessionStatus, User, UserRole } from './types';
 import { authGuard, forbidObserver, signToken } from './auth';
 import {
   closeAssignmentById,
@@ -26,7 +26,6 @@ import {
   insertProfile,
   insertAssignmentRecord,
   insertResumeRecord,
-  updateResumeParsed,
   insertUser,
   listAssignments,
   listBidderSummaries,
@@ -42,11 +41,20 @@ const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
 const app = fastify({ logger: true });
 const PROJECT_ROOT = path.join(__dirname, '..');
 const RESUME_DIR = process.env.RESUME_DIR ?? path.join(PROJECT_ROOT, 'data', 'resumes');
+const HF_TOKEN =
+  process.env.HF_TOKEN || process.env.HUGGINGFACEHUB_API_TOKEN || process.env.HUGGING_FACE_TOKEN || '';
+const HF_MODEL = process.env.HF_MODEL || 'meta-llama/Meta-Llama-3-8B-Instruct';
 
 const livePages = new Map<
   string,
   { browser: Browser; page: Page; interval?: NodeJS.Timeout }
 >();
+
+type FillPlanResult = {
+  filled?: { field: string; value: string; confidence?: number }[];
+  suggestions?: { field: string; suggestion: string }[];
+  blocked?: string[];
+};
 
 function sanitizeText(input: string | undefined | null) {
   if (!input) return '';
@@ -104,7 +112,6 @@ async function extractResumeTextFromFile(filePath: string, fileName?: string) {
 }
 
 async function saveParsedResumeJson(resumeId: string, parsed: unknown) {
-  await updateResumeParsed(resumeId, { resumeJson: parsed as Record<string, unknown> });
 }
 
 async function tryParseResumeText(resumeId: string, resumeText: string, baseProfile?: BaseInfo) {
@@ -258,6 +265,402 @@ function simpleParseResume(resumeText: string) {
   };
 }
 
+async function collectPageFieldsFromFrame(frame: Frame) {
+  return frame.evaluate(() => {
+    const norm = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
+    const textOf = (el?: Element | null) => norm(el?.textContent || (el as HTMLElement | null)?.innerText || '');
+    const isVisible = (el: Element) => {
+      const cs = window.getComputedStyle(el);
+      if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return false;
+      const r = el.getBoundingClientRect();
+      return r.width > 0 && r.height > 0;
+    };
+    const esc = (v: string) =>
+      (window.CSS && CSS.escape ? CSS.escape(v) : v.replace(/[^a-zA-Z0-9_-]/g, '\\$&'));
+
+    const getLabelText = (el: Element) => {
+      try {
+        const labels = (el as HTMLInputElement).labels;
+        if (labels && labels.length) {
+          const t = Array.from(labels)
+            .map((n) => textOf(n))
+            .filter(Boolean);
+          if (t.length) return t.join(' ');
+        }
+      } catch {
+        /* ignore */
+      }
+      const id = el.getAttribute('id');
+      if (id) {
+        const lab = document.querySelector(`label[for="${esc(id)}"]`);
+        const t = textOf(lab);
+        if (t) return t;
+      }
+      const wrap = el.closest('label');
+      const t2 = textOf(wrap);
+      return t2 || '';
+    };
+
+    const getAriaName = (el: Element) => {
+      const direct = norm(el.getAttribute('aria-label'));
+      if (direct) return direct;
+      const labelledBy = norm(el.getAttribute('aria-labelledby'));
+      if (labelledBy) {
+        const parts = labelledBy
+          .split(/\s+/)
+          .map((id) => textOf(document.getElementById(id)))
+          .filter(Boolean);
+        return norm(parts.join(' '));
+      }
+      return '';
+    };
+
+    const getDescribedBy = (el: Element) => {
+      const ids = norm(el.getAttribute('aria-describedby'));
+      if (!ids) return '';
+      const parts = ids
+        .split(/\s+/)
+        .map((id) => textOf(document.getElementById(id)))
+        .filter(Boolean);
+      return norm(parts.join(' '));
+    };
+
+    const findFieldContainer = (el: Element) =>
+      el.closest(
+        "fieldset, [role='group'], .form-group, .field, .input-group, .question, .formField, section, article, li, div"
+      ) || el.parentElement;
+
+    const collectNearbyPrompts = (el: Element) => {
+      const container = findFieldContainer(el);
+      if (!container) return [];
+
+      const prompts: { source: string; text: string }[] = [];
+
+      const fieldset = el.closest('fieldset');
+      if (fieldset) {
+        const legend = fieldset.querySelector('legend');
+        const t = textOf(legend);
+        if (t) prompts.push({ source: 'legend', text: t });
+      }
+
+      const candidates = container.querySelectorAll(
+        "h1,h2,h3,h4,h5,h6,p,.help,.hint,.description,[data-help],[data-testid*='help']"
+      );
+      candidates.forEach((n) => {
+        const t = textOf(n);
+        if (t && t.length <= 350) prompts.push({ source: 'container_text', text: t });
+      });
+
+      let sib: Element | null = el.previousElementSibling;
+      let steps = 0;
+      while (sib && steps < 4) {
+        const tag = sib.tagName.toLowerCase();
+        if (['div', 'p', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'label'].includes(tag)) {
+          const t = textOf(sib);
+          if (t && t.length <= 350) prompts.push({ source: 'prev_sibling', text: t });
+        }
+        sib = sib.previousElementSibling;
+        steps += 1;
+      }
+
+      return prompts;
+    };
+
+    const looksBoilerplate = (t: string) => {
+      const s = t.toLowerCase();
+      return (
+        s.includes('privacy') ||
+        s.includes('terms') ||
+        s.includes('cookies') ||
+        s.includes('equal opportunity') ||
+        s.includes('eeo') ||
+        s.includes('gdpr')
+      );
+    };
+
+    const scorePrompt = (text: string, source: string) => {
+      const s = text.toLowerCase();
+      let score = 0;
+      if (text.includes('?')) score += 6;
+      if (/^(why|how|what|describe|explain|tell us|please describe|please explain)\b/i.test(text)) score += 4;
+      if (/(position|role|motivation|interested|interest|experience|background|cover letter)/i.test(text)) score += 2;
+      if (text.length >= 20 && text.length <= 220) score += 3;
+      if (source === 'label' || source === 'aria') score += 5;
+      if (source === 'describedby') score += 3;
+      if (text.length > 350) score -= 4;
+      if (looksBoilerplate(text)) score -= 6;
+      if (/^(optional|required)\b/i.test(text)) score -= 5;
+      if (s === 'optional' || s === 'required') score -= 5;
+      return score;
+    };
+
+    const parseTextConstraints = (text: string) => {
+      const t = text.toLowerCase();
+      const out: Record<string, number> = {};
+      const words = t.match(/max(?:imum)?\s*(\d+)\s*words?/);
+      if (words) out.max_words = parseInt(words[1], 10);
+      const chars = t.match(/max(?:imum)?\s*(\d+)\s*(characters|chars)/);
+      if (chars) out.max_chars = parseInt(chars[1], 10);
+      const minChars = t.match(/min(?:imum)?\s*(\d+)\s*(characters|chars)/);
+      if (minChars) out.min_chars = parseInt(minChars[1], 10);
+      return out;
+    };
+
+    const recommendedLocators = (el: Element, bestLabel?: string | null) => {
+      const tag = el.tagName.toLowerCase();
+      const id = el.getAttribute('id');
+      const name = el.getAttribute('name');
+      const placeholder = el.getAttribute('placeholder');
+      const locators: Record<string, string> = {};
+      if (id) locators.css = `#${esc(id)}`;
+      else if (name) locators.css = `${tag}[name="${esc(name)}"]`;
+      else locators.css = tag;
+
+      if (bestLabel) locators.playwright = `getByLabel(${JSON.stringify(bestLabel)})`;
+      else if (placeholder) locators.playwright = `getByPlaceholder(${JSON.stringify(placeholder)})`;
+      else locators.playwright = `locator(${JSON.stringify(locators.css)})`;
+      return locators;
+    };
+
+    const slug = (v: string) => norm(v).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+
+    const controls = Array.from(
+      document.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]')
+    ).slice(0, 150);
+
+    const fields: any[] = [];
+    controls.forEach((el, idx) => {
+      const tag = el.tagName.toLowerCase();
+      if (tag === 'input') {
+        const t = ((el as HTMLInputElement).type || el.getAttribute('type') || 'text').toLowerCase();
+        if (['hidden', 'submit', 'button', 'image', 'reset'].includes(t)) return;
+      }
+      if (!isVisible(el)) return;
+
+      const label = norm(getLabelText(el));
+      const ariaName = norm(getAriaName(el));
+      const describedBy = norm(getDescribedBy(el));
+      const placeholder = norm(el.getAttribute('placeholder'));
+      const autocomplete = norm(el.getAttribute('autocomplete'));
+      const name = norm(el.getAttribute('name'));
+      const id = norm(el.getAttribute('id'));
+      const required = Boolean((el as HTMLInputElement).required);
+
+      const type =
+        tag === 'input'
+          ? (norm((el as HTMLInputElement).type || el.getAttribute('type')) || 'text').toLowerCase()
+          : tag === 'textarea'
+            ? 'textarea'
+            : tag === 'select'
+              ? 'select'
+              : (el.getAttribute('role') === 'textbox' || el.getAttribute('contenteditable') === 'true')
+                ? 'richtext'
+                : tag;
+
+      const promptCandidates: { source: string; text: string; score: number }[] = [];
+      if (label) promptCandidates.push({ source: 'label', text: label, score: scorePrompt(label, 'label') });
+      if (ariaName) promptCandidates.push({ source: 'aria', text: ariaName, score: scorePrompt(ariaName, 'aria') });
+      if (placeholder) {
+        promptCandidates.push({
+          source: 'placeholder',
+          text: placeholder,
+          score: scorePrompt(placeholder, 'placeholder'),
+        });
+      }
+      if (describedBy) {
+        promptCandidates.push({
+          source: 'describedby',
+          text: describedBy,
+          score: scorePrompt(describedBy, 'describedby'),
+        });
+      }
+      const nearbyPrompts = collectNearbyPrompts(el);
+      nearbyPrompts.forEach((p) => {
+        promptCandidates.push({ ...p, score: scorePrompt(p.text, p.source) });
+      });
+
+      const best = promptCandidates
+        .filter((p) => p.text)
+        .sort((a, b) => b.score - a.score)[0];
+      const questionText = best?.text || '';
+      const locators = recommendedLocators(el, label || ariaName || questionText || placeholder);
+
+      const constraints: Record<string, number> = {};
+      const maxlen = el.getAttribute('maxlength');
+      const minlen = el.getAttribute('minlength');
+      if (maxlen) constraints.maxlength = parseInt(maxlen, 10);
+      if (minlen) constraints.minlength = parseInt(minlen, 10);
+      Object.assign(constraints, parseTextConstraints(`${questionText} ${describedBy}`));
+
+      const textForEssay = `${questionText} ${label} ${describedBy}`.toLowerCase();
+      const likelyEssay =
+        type === 'textarea' ||
+        type === 'richtext' ||
+        Boolean(constraints.max_words) ||
+        Boolean(constraints.max_chars && constraints.max_chars > 180) ||
+        (/why|tell us|describe|explain|motivation|interest|cover letter|statement/.test(textForEssay) &&
+          (questionText.length > 0 || label.length > 0));
+
+      const fallbackId = slug(label || ariaName || questionText || placeholder || name || '') || `field_${idx}`;
+      const fieldId = id || name || fallbackId;
+
+      fields.push({
+        index: fields.length,
+        field_id: fieldId,
+        tag,
+        type,
+        id: id || null,
+        name: name || null,
+        label: label || null,
+        ariaName: ariaName || null,
+        placeholder: placeholder || null,
+        describedBy: describedBy || null,
+        autocomplete: autocomplete || null,
+        required,
+        visible: true,
+        questionText: questionText || null,
+        questionCandidates: promptCandidates
+          .sort((a, b) => b.score - a.score)
+          .slice(0, 5),
+        constraints,
+        locators: {
+          css: locators.css,
+          playwright: locators.playwright,
+        },
+        selector: locators.css,
+        likelyEssay,
+        containerPrompts: nearbyPrompts,
+      });
+    });
+
+    return fields;
+  });
+}
+
+async function collectPageFields(page: Page) {
+  const frames = page.frames();
+  const results = await Promise.all(
+    frames.map(async (frame) => {
+      try {
+        return await collectPageFieldsFromFrame(frame);
+      } catch (err) {
+        console.error('collectPageFields frame failed', err);
+        return [];
+      }
+    }),
+  );
+  const merged = results.flat();
+  if (merged.length) return merged.slice(0, 300);
+
+  // fallback to main frame attempt
+  try {
+    return await collectPageFieldsFromFrame(page.mainFrame());
+  } catch {
+    return [];
+  }
+}
+
+async function applyFillPlan(page: Page, plan: any[]): Promise<FillPlanResult> {
+  const filled: { field: string; value: string; confidence?: number }[] = [];
+  const suggestions: { field: string; suggestion: string }[] = [];
+  const blocked: string[] = [];
+
+  for (const f of plan) {
+    const action = f.action;
+    const value = f.value;
+    const selector =
+      f.selector ||
+      (f.field_id ? `[name="${f.field_id}"], #${f.field_id}, [id*="${f.field_id}"]` : undefined);
+    if (!selector) {
+      blocked.push(f.field_id ?? 'field');
+      continue;
+    }
+    try {
+      if (action === 'fill') {
+        await page.fill(selector, typeof value === 'string' ? value : String(value ?? ''));
+        filled.push({
+          field: f.field_id ?? selector,
+          value: typeof value === 'string' ? value : JSON.stringify(value ?? ''),
+          confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
+        });
+      } else if (action === 'select') {
+        await page.selectOption(selector, { label: String(value ?? '') });
+        filled.push({
+          field: f.field_id ?? selector,
+          value: String(value ?? ''),
+          confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
+        });
+      } else if (action === 'check' || action === 'uncheck') {
+        if (action === 'check') await page.check(selector);
+        else await page.uncheck(selector);
+        filled.push({ field: f.field_id ?? selector, value: action });
+      } else if (f.requires_user_review) {
+        blocked.push(f.field_id ?? selector);
+      }
+    } catch {
+      blocked.push(f.field_id ?? selector);
+    }
+  }
+  return { filled, suggestions, blocked };
+}
+
+async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any): Promise<FillPlanResult> {
+  const fullName = [baseInfo?.name?.first, baseInfo?.name?.last].filter(Boolean).join(' ').trim();
+  const email = baseInfo?.contact?.email;
+  const phone = baseInfo?.contact?.phone;
+  const city = baseInfo?.location?.city;
+  const country = baseInfo?.location?.country;
+  const linkedin = baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin;
+  const company = parsedResume?.experience?.[0]?.company;
+  const title = parsedResume?.experience?.[0]?.title;
+
+  const filled: { field: string; value: string; confidence?: number }[] = [];
+  const targets = [
+    { key: 'full_name', match: /full\s*name/i, value: fullName },
+    { key: 'first', match: /first/i, value: baseInfo?.name?.first },
+    { key: 'last', match: /last/i, value: baseInfo?.name?.last },
+    { key: 'email', match: /email/i, value: email },
+    { key: 'phone', match: /phone|tel/i, value: phone },
+    { key: 'city', match: /city/i, value: city },
+    { key: 'country', match: /country|nation/i, value: country },
+    { key: 'company', match: /company|employer/i, value: company },
+    { key: 'title', match: /title|position|role/i, value: title },
+    { key: 'linkedin', match: /linkedin|linked\s*in/i, value: linkedin },
+  ].filter((t) => t.value);
+
+  const inputs = await page.$$('input, textarea, select');
+  for (const el of inputs) {
+    const props = await el.evaluate((node) => {
+      const lbl = (node as HTMLInputElement).labels?.[0]?.innerText || '';
+      return {
+        tag: node.tagName.toLowerCase(),
+        type: (node as HTMLInputElement).type || node.getAttribute('type') || 'text',
+        name: node.getAttribute('name') || '',
+        id: node.id || '',
+        placeholder: node.getAttribute('placeholder') || '',
+        label: lbl,
+      };
+    });
+    if (props.type === 'checkbox' || props.type === 'radio' || props.type === 'file') continue;
+    const haystack = `${props.label} ${props.name} ${props.id} ${props.placeholder}`.toLowerCase();
+    const match = targets.find((t) => t.match.test(haystack));
+    if (match) {
+      const val = String(match.value ?? '');
+      try {
+        if (props.tag === 'select') {
+          await el.selectOption({ label: val });
+        } else {
+          await el.fill(val);
+        }
+        filled.push({ field: props.name || props.id || match.key, value: val });
+      } catch {
+        // ignore failed fills
+      }
+    }
+  }
+  return { filled, suggestions: [], blocked: [] };
+}
+
 async function hydrateResume(resume: Resume, baseProfile?: BaseInfo) {
   let resumeText = resume.resumeText ?? '';
   if (!resumeText && resume.filePath) {
@@ -265,7 +668,8 @@ async function hydrateResume(resume: Resume, baseProfile?: BaseInfo) {
     resumeText = await extractResumeTextFromFile(resolved, path.basename(resume.filePath));
   }
   resumeText = sanitizeText(resumeText);
-  return { ...resume, resumeText };
+  const parsedResume = await tryParseResumeText(resume.id, resumeText, baseProfile);
+  return { ...resume, resumeText, parsedResume };
 }
 
 const DEFAULT_AUTOFILL_FIELDS = [
@@ -295,6 +699,26 @@ async function bootstrap() {
   await fs.mkdir(RESUME_DIR, { recursive: true });
 
   app.get('/health', async () => ({ status: 'ok' }));
+
+  app.get('/sessions/:id/top-resumes', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const { id } = request.params as { id: string };
+    const session = sessions.find((s) => s.id === id);
+    if (!session) return reply.status(404).send({ message: 'Session not found' });
+
+    const jdText = String((session.jobContext as any)?.job_description_text ?? '').trim();
+    if (!jdText) {
+      return reply.status(400).send({ message: 'Job description missing for this session' });
+    }
+
+    try {
+      const top = await getTopMatchedResumesFromSession(session, jdText, request.log);
+      return top;
+    } catch (err) {
+      request.log.error({ err }, 'failed to score resumes');
+      return reply.status(500).send({ message: 'Failed to score resumes' });
+    }
+  });
 
   app.post('/auth/login', async (request, reply) => {
     const schema = z.object({ email: z.string().email(), password: z.string().optional() });
@@ -574,8 +998,8 @@ async function bootstrap() {
         .send({ message: 'Profile already assigned', assignmentId: existing.id });
     }
 
-    const newAssignment = {
-      id: randomUUID(),
+    const newAssignment: Assignment = {
+      id: body.profileId,
       profileId: body.profileId,
       bidderUserId: body.bidderUserId,
       assignedBy: actor.id ?? body.assignedBy ?? body.bidderUserId,
@@ -676,19 +1100,11 @@ async function bootstrap() {
     const { id } = request.params as { id: string };
     const session = sessions.find((s) => s.id === id);
     if (!session) return reply.status(404).send({ message: 'Session not found' });
-    const profileResumesList = await listResumesByProfile(session.profileId);
-    const hydratedResumes = await Promise.all(profileResumesList.map((r) => hydrateResume(r)));
-    const analysis = await analyzeJobFromUrl(
-      session.url,
-      hydratedResumes.map((r) => ({
-        id: r.id,
-        label: r.label,
-        parsed: r.resumeJson ?? {},
-        resume_text: r.resumeText ?? '',
-      })),
-    );
+    const body = (request.body as { useAi?: boolean } | undefined) ?? {};
+    const useAi = Boolean(body.useAi);
 
-    session.recommendedResumeId = analysis.recommendedResumeId;
+    const analysis = await analyzeJobFromUrl(session.url);
+
     session.status = 'ANALYZED';
     session.jobContext = {
       title: analysis.title || 'Job',
@@ -696,23 +1112,51 @@ async function bootstrap() {
       summary: 'Analysis from job description',
       job_description_text: analysis.jobText ?? '',
     };
+
+    if (!useAi) {
+      const topTech = (analysis.ranked ?? []).slice(0, 4);
+      events.push({
+        id: randomUUID(),
+        sessionId: id,
+        eventType: 'ANALYZE_DONE',
+        payload: {
+          recommendedLabel: analysis.recommendedLabel,
+        },
+        createdAt: new Date().toISOString(),
+      });
+      return {
+        mode: 'tech',
+        recommendedLabel: analysis.recommendedLabel,
+        ranked: topTech.map((t, idx) => ({
+          id: t.id ?? t.label ?? `tech-${idx}`,
+          label: t.label,
+          rank: idx + 1,
+          score: t.score,
+        })),
+        scores: analysis.rawScores,
+        jobContext: session.jobContext,
+      };
+    }
+
+    const jdText = String((session.jobContext as any)?.job_description_text ?? '');
+    const topResumes = jdText ? await getTopMatchedResumesFromSession(session, jdText, request.log) : [];
+    session.recommendedResumeId = topResumes[0]?.id ?? analysis.recommendedResumeId;
     events.push({
       id: randomUUID(),
       sessionId: id,
       eventType: 'ANALYZE_DONE',
-      payload: { recommendedLabel: analysis.recommendedLabel, recommendedResumeId: analysis.recommendedResumeId },
+      payload: {
+        recommendedLabel: topResumes[0]?.title ?? analysis.recommendedLabel,
+        recommendedResumeId: topResumes[0]?.id ?? analysis.recommendedResumeId,
+      },
       createdAt: new Date().toISOString(),
     });
     return {
-      recommendedResumeId: analysis.recommendedResumeId,
-      recommendedLabel: analysis.recommendedLabel,
-      ranked: analysis.ranked.map((r, idx) => ({
-        id: r.id ?? `${r.label}-${idx}`,
-        label: r.label,
-        rank: idx + 1,
-        score: r.score,
-      })),
-      scores: analysis.rawScores,
+      mode: 'resume',
+      recommendedResumeId: topResumes[0]?.id ?? analysis.recommendedResumeId,
+      recommendedLabel: topResumes[0]?.title ?? analysis.recommendedLabel,
+      ranked: topResumes.map((r, idx) => ({ id: r.id, label: r.title, rank: idx + 1, score: r.score })),
+      scores: {},
       jobContext: session.jobContext,
     };
   });
@@ -781,65 +1225,119 @@ async function bootstrap() {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
     const body = (request.body as { selectedResumeId?: string; pageFields?: any[] }) ?? {};
-    const session = sessions.find((s) => s.id === id);
-    if (!session) return reply.status(404).send({ message: 'Session not found' });
-    const profile = await findProfileById(session.profileId);
-    if (!profile) return reply.status(404).send({ message: 'Profile not found' });
-    if (body.selectedResumeId) {
+  const session = sessions.find((s) => s.id === id);
+  if (!session) return reply.status(404).send({ message: 'Session not found' });
+  const profile = await findProfileById(session.profileId);
+  if (!profile) return reply.status(404).send({ message: 'Profile not found' });
+  if (body.selectedResumeId) {
       session.selectedResumeId = body.selectedResumeId;
     }
 
     const profileResumes = await listResumesByProfile(session.profileId);
-    const resumeId =
-      session.selectedResumeId ?? session.recommendedResumeId ?? body.selectedResumeId ?? profileResumes[0]?.id;
-    const resumeRecord = resumeId ? await findResumeById(resumeId) : undefined;
-    const hydratedResume = resumeRecord ? await hydrateResume(resumeRecord, profile.baseInfo) : undefined;
+  const resumeId =
+    session.selectedResumeId ?? session.recommendedResumeId ?? body.selectedResumeId ?? profileResumes[0]?.id;
+  const resumeRecord = resumeId ? await findResumeById(resumeId) : undefined;
+  const hydratedResume = resumeRecord ? await hydrateResume(resumeRecord, profile.baseInfo) : undefined;
 
-    let fillPlan = buildDemoFillPlan(profile.baseInfo);
+  const live = livePages.get(id);
+  const page = live?.page;
+  let pageFields: any[] = [];
+  if (page) {
     try {
-      const pageFields = Array.isArray(body.pageFields) && body.pageFields.length > 0 ? body.pageFields : DEFAULT_AUTOFILL_FIELDS;
-      if (hydratedResume?.resumeText) {
-        const prompt = promptBuilders.buildAutofillPlanPrompt({
-          pageFields,
-          baseProfile: profile.baseInfo ?? {},
-          prefs: {},
-          jobContext: session.jobContext ?? {},
-          selectedResume: {
-            resume_id: hydratedResume.id,
-            label: hydratedResume.label,
-            parsed_resume_json: hydratedResume.resumeJson ?? {},
-            resume_text: hydratedResume.resumeText,
-          },
-          pageContext: { url: session.url },
-        });
-        const parsed = await callPromptPack(prompt);
-        const llmPlan = parsed?.result?.fill_plan;
-        if (Array.isArray(llmPlan)) {
-          const filled = llmPlan
-            .filter((f: any) => (f.action === 'fill' || f.action === 'select') && f.value)
-            .map((f: any) => ({
-              field: f.field_id ?? f.selector ?? f.label ?? 'field',
-              value: typeof f.value === 'string' ? f.value : JSON.stringify(f.value ?? ''),
-              confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
-            }));
-          const suggestions =
-            (Array.isArray(parsed?.warnings) ? parsed?.warnings : []).map((w: any) => ({
-              field: 'note',
-              suggestion: String(w),
-            })) ?? [];
-          const blocked = llmPlan
-            .filter((f: any) => f.requires_user_review)
-            .map((f: any) => f.field_id ?? f.selector ?? 'field');
-          fillPlan = { filled, suggestions, blocked };
+      pageFields = await collectPageFields(page);
+    } catch (err) {
+      request.log.error({ err }, 'collectPageFields failed');
+    }
+  }
+  // Fallback: if no live page or nothing detected, spin up a fresh headless page to capture fields.
+  if ((!page || pageFields.length === 0) && session.url) {
+    try {
+      const browser = await chromium.launch({ headless: true });
+      const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+      const tmpPage = await context.newPage();
+      await tmpPage.goto(session.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
+      // small settle time for dynamic renderers
+      await tmpPage.waitForTimeout(800);
+      await tmpPage
+        .waitForSelector('input, textarea, select, [contenteditable="true"], [role="textbox"]', { timeout: 5000 })
+        .catch(() => {});
+      pageFields = await collectPageFields(tmpPage);
+      await browser.close();
+    } catch (err) {
+      request.log.error({ err }, 'collectPageFields headless fallback failed');
+    }
+  }
+
+  let candidateFields: any[] =
+    Array.isArray(body.pageFields) && body.pageFields.length > 0
+      ? body.pageFields
+      : pageFields.length
+        ? pageFields
+        : DEFAULT_AUTOFILL_FIELDS;
+  let fillPlan: FillPlanResult = buildDemoFillPlan(profile.baseInfo);
+  try {
+    if (hydratedResume?.resumeText) {
+      const prompt = promptBuilders.buildAutofillPlanPrompt({
+        pageFields: candidateFields,
+        baseProfile: profile.baseInfo ?? {},
+        prefs: {},
+        jobContext: session.jobContext ?? {},
+        selectedResume: {
+          resume_id: hydratedResume.id,
+          label: hydratedResume.label,
+          parsed_resume_json: hydratedResume.parsedResume ?? {},
+          resume_text: hydratedResume.resumeText,
+        },
+        pageContext: { url: session.url },
+      });
+      const parsed = await callPromptPack(prompt);
+      const llmPlan = parsed?.result?.fill_plan;
+      if (Array.isArray(llmPlan)) {
+        const applied = page ? await applyFillPlan(page, llmPlan) : { filled: [], blocked: [], suggestions: [] };
+        const filledFromPlan = llmPlan
+          .filter((f: any) => (f.action === 'fill' || f.action === 'select') && f.value)
+          .map((f: any) => ({
+            field: f.field_id ?? f.selector ?? f.label ?? 'field',
+            value: typeof f.value === 'string' ? f.value : JSON.stringify(f.value ?? ''),
+            confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
+          }));
+        const suggestions =
+          (Array.isArray(parsed?.warnings) ? parsed?.warnings : []).map((w: any) => ({
+            field: 'note',
+            suggestion: String(w),
+          })) ?? [];
+        const blocked = llmPlan
+          .filter((f: any) => f.requires_user_review)
+          .map((f: any) => f.field_id ?? f.selector ?? 'field');
+        fillPlan = {
+          filled: [...filledFromPlan, ...(applied.filled ?? [])],
+          suggestions: [...suggestions, ...(applied.suggestions ?? [])],
+          blocked: [...blocked, ...(applied.blocked ?? [])],
+        };
+        if ((!fillPlan.filled || fillPlan.filled.length === 0) && page) {
+          const simple = await simplePageFill(page, profile.baseInfo, hydratedResume.parsedResume);
+          fillPlan = {
+            filled: [...(fillPlan.filled ?? []), ...(simple.filled ?? [])],
+            suggestions: [...(fillPlan.suggestions ?? []), ...(simple.suggestions ?? [])],
+            blocked: [...(fillPlan.blocked ?? []), ...(simple.blocked ?? [])],
+          };
         }
       }
-    } catch (err) {
-      request.log.error({ err }, 'LLM autofill failed, using demo plan');
     }
+  } catch (err) {
+    request.log.error({ err }, 'LLM autofill failed, using demo plan');
+    if (page) {
+      try {
+        fillPlan = await simplePageFill(page, profile.baseInfo, hydratedResume?.parsedResume);
+      } catch (e) {
+        request.log.error({ err: e }, 'simplePageFill failed');
+      }
+    }
+  }
 
-    session.status = 'FILLED';
-    session.selectedResumeId = resumeId ?? session.selectedResumeId;
-    session.fillPlan = fillPlan;
+  session.status = 'FILLED';
+  session.selectedResumeId = resumeId ?? session.selectedResumeId;
+  session.fillPlan = fillPlan;
     events.push({
       id: randomUUID(),
       sessionId: id,
@@ -847,7 +1345,7 @@ async function bootstrap() {
       payload: session.fillPlan,
       createdAt: new Date().toISOString(),
     });
-    return { fillPlan: session.fillPlan };
+    return { fillPlan: session.fillPlan, pageFields, candidateFields };
   });
 
   app.post('/sessions/:id/mark-submitted', async (request, reply) => {
@@ -1022,15 +1520,18 @@ function tryExtractDomain(url: string) {
   }
 }
 
-function buildDemoFillPlan(baseInfo: BaseInfo) {
+function buildDemoFillPlan(baseInfo: BaseInfo): FillPlanResult {
   const safeFields = [
     { field: 'first_name', value: baseInfo?.name?.first, confidence: 0.98 },
     { field: 'last_name', value: baseInfo?.name?.last, confidence: 0.98 },
     { field: 'email', value: baseInfo?.contact?.email, confidence: 0.97 },
     { field: 'phone', value: baseInfo?.contact?.phone, confidence: 0.8 },
   ];
+  const filled = safeFields
+    .filter((f) => Boolean(f.value))
+    .map((f) => ({ field: f.field, value: String(f.value ?? ''), confidence: f.confidence }));
   return {
-    filled: safeFields.filter((f) => f.value),
+    filled,
     suggestions: [{ field: 'cover_letter', suggestion: 'Short note about relevant skills' }],
     blocked: ['EEO', 'veteran_status', 'disability'],
   };
@@ -1057,6 +1558,196 @@ function resolveResumePath(p: string) {
 }
 
 bootstrap();
+
+function normalizeScore(parsed: any): number | undefined {
+  const val =
+    typeof parsed === 'number'
+      ? parsed
+      : typeof parsed === 'string'
+        ? Number(parsed)
+        : typeof parsed?.score === 'number'
+          ? parsed.score
+          : typeof parsed?.result?.score === 'number'
+            ? parsed.result.score
+            : undefined;
+  if (typeof val === 'number' && !Number.isNaN(val) && val >= 0 && val <= 100) {
+    return val;
+  }
+  return undefined;
+}
+
+const STOP_WORDS = new Set([
+  'the',
+  'and',
+  'for',
+  'with',
+  'from',
+  'this',
+  'that',
+  'you',
+  'your',
+  'are',
+  'will',
+  'have',
+  'our',
+  'we',
+  'they',
+  'their',
+  'about',
+  'into',
+  'what',
+  'when',
+  'where',
+  'which',
+  'while',
+  'without',
+  'within',
+  'such',
+  'using',
+  'used',
+  'use',
+  'role',
+  'team',
+  'work',
+  'experience',
+  'skills',
+  'ability',
+  'strong',
+  'including',
+  'include',
+]);
+
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9+\.#]+/g)
+    .filter((t) => t.length > 2 && !STOP_WORDS.has(t));
+}
+
+function topKeywordsFromJd(jdText: string, limit = 12): string[] {
+  const counts = new Map<string, number>();
+  for (const token of tokenize(jdText)) {
+    counts.set(token, (counts.get(token) ?? 0) + 1);
+  }
+  return Array.from(counts.entries())
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, limit)
+    .map(([k]) => k);
+}
+
+function overlapCount(tokens: Set<string>, keywords: Set<string>): number {
+  let count = 0;
+  for (const k of keywords) {
+    if (tokens.has(k)) count += 1;
+  }
+  return count;
+}
+
+async function callHfScore(prompt: string, logger?: any, resumeId?: string): Promise<any | undefined> {
+  if (!HF_TOKEN) {
+    logger?.warn({ resumeId }, 'hf-score-skip-no-token');
+    return undefined;
+  }
+  try {
+    const res = await fetch('https://router.huggingface.co/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${HF_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        model: HF_MODEL,
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 128,
+        temperature: 0.1,
+        top_p: 0.9,
+        n: 1,
+      }),
+    });
+    const data = (await res.json()) as any;
+    const choiceContent =
+      data?.choices?.[0]?.message?.content ||
+      (Array.isArray(data) && data[0]?.generated_text) ||
+      data?.generated_text ||
+      data?.text;
+    const text = typeof choiceContent === 'string' ? choiceContent.trim() : undefined;
+    if (text) {
+      try {
+        return JSON.parse(text);
+      } catch {
+        logger?.warn({ resumeId }, 'hf-score-parse-text-failed');
+      }
+    }
+    if (data && typeof data === 'object' && !data.error) return data;
+    logger?.warn({ resumeId, data }, 'hf-score-unexpected-response');
+  } catch (err) {
+    logger?.error({ resumeId }, 'hf-score-call-failed');
+  }
+  return undefined;
+}
+
+async function scoreResumeWithHf(
+  jdText: string,
+  resumeText: string,
+  logger?: any,
+  resumeId?: string,
+  opts?: { title?: string; keywords?: string[] },
+): Promise<number | undefined> {
+  if (!jdText.trim() || !resumeText.trim()) {
+    logger?.warn({ resumeId }, 'hf-score-skip-empty');
+    return undefined;
+  }
+  const prompt = `You are a resume matcher. Score how well the resume fits the job.
+Return ONLY valid JSON: {"score": number_between_0_and_100}
+- 100 = perfect fit, 0 = not a fit.
+- Emphasize required skills, title fit, and domain.
+- Ignore formatting; be concise.
+Job Title: ${opts?.title ?? 'Unknown'}
+Key skills to emphasize: ${opts?.keywords?.join(', ') || 'n/a'}
+Job Description (truncated):
+${jdText.slice(0, 3000)}
+
+Resume (truncated):
+${resumeText.slice(0, 6000)}
+`;
+  try {
+    const parsed = (await callHfScore(prompt, logger, resumeId)) ?? (await callPromptPack(prompt));
+    const scoreVal = normalizeScore(parsed);
+    if (typeof scoreVal === 'number') return Math.round(scoreVal);
+    logger?.warn({ resumeId, parsed }, 'hf-score-parse-failed');
+  } catch {
+    logger?.error({ resumeId }, 'hf-score-exception');
+  }
+}
+
+async function getTopMatchedResumesFromSession(session: ApplicationSession, jdText: string, logger: any) {
+  const profile = await findProfileById(session.profileId);
+  const resumesForProfile = await listResumesByProfile(session.profileId);
+  const limited = resumesForProfile.slice(0, 200);
+  const keywords = topKeywordsFromJd(jdText);
+  const keywordSet = new Set(keywords);
+  const title = (session.jobContext as any)?.title as string | undefined;
+
+  const scored: { id: string; title: string; score: number; tie: number }[] = [];
+  for (const r of limited) {
+    let hydrated = r;
+    try {
+      hydrated = await hydrateResume(r, profile?.baseInfo);
+    } catch {
+      // ignore hydrate errors, fall back to DB text
+    }
+    const resumeText = hydrated.resumeText ?? '';
+    const hfScore = await scoreResumeWithHf(jdText, resumeText, logger, r.id, { title, keywords });
+    const finalScore = typeof hfScore === 'number' ? hfScore : 0;
+    const resumeTokens = new Set(tokenize(resumeText));
+    const tie = overlapCount(resumeTokens, keywordSet);
+    logger.info({ resumeId: r.id, score: finalScore, tie }, 'resume-scored');
+    scored.push({ id: r.id, title: r.label, score: finalScore, tie });
+  }
+  return scored
+    .sort((a, b) => b.score - a.score || b.tie - a.tie || a.title.localeCompare(b.title))
+    .slice(0, 4);
+}
 
 async function startBrowserSession(session: ApplicationSession) {
   const existing = livePages.get(session.id);

@@ -9,7 +9,7 @@ export interface User {
   password?: string;
 }
 
-export interface BaseInfo {
+export interface BaseInfo extends Record<string, unknown> {
   name: { first: string; last: string };
   contact: { email: string; phone?: string };
   links?: Record<string, string>;
@@ -26,6 +26,9 @@ export interface Profile {
   createdBy: string;
   createdAt: string;
   updatedAt: string;
+  assignedBidderId?: string | null;
+  assignedBy?: string | null;
+  assignedAt?: string | null;
 }
 
 export interface Resume {

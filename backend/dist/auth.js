@@ -12,7 +12,7 @@ const db_1 = require("./db");
 const JWT_SECRET = process.env.JWT_SECRET || 'dev-smartwork-jwt-secret';
 function signToken(user) {
     const payload = { sub: user.id, role: user.role, email: user.email, name: user.name };
-    return jsonwebtoken_1.default.sign(payload, JWT_SECRET, { expiresIn: '1h' });
+    return jsonwebtoken_1.default.sign(payload, JWT_SECRET, { expiresIn: '8h' });
 }
 exports.authGuard = (0, fastify_plugin_1.default)(async (instance) => {
     instance.addHook('preHandler', async (request, reply) => {

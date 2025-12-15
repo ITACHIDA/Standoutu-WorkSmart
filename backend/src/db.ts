@@ -354,19 +354,29 @@ export type BidderSummary = {
 };
 
 export async function listBidderSummaries(): Promise<BidderSummary[]> {
-  const { rows } = await pool.query<BidderSummary & { profiles?: any }>(`
-    SELECT
-      u.id,
-      u.name,
-      u.email
-    FROM users u
-    WHERE u.role = 'BIDDER'
-    ORDER BY u.name ASC
-  `);
+  const { rows } = await pool.query<BidderSummary & { profiles?: { id: string; displayName: string }[] }>(
+    `
+      SELECT
+        u.id,
+        u.name,
+        u.email,
+        COALESCE(
+          json_agg(
+            json_build_object('id', p.id, 'displayName', p.display_name)
+          ) FILTER (WHERE p.id IS NOT NULL),
+          '[]'::json
+        ) AS profiles
+      FROM users u
+      LEFT JOIN profiles p ON p.assigned_bidder_id = u.id
+      WHERE u.role = 'BIDDER' AND u.is_active IS NOT FALSE
+      GROUP BY u.id, u.name, u.email
+      ORDER BY u.name ASC
+    `,
+  );
   return rows.map((r) => ({
     id: r.id,
     name: r.name,
     email: r.email,
-    profiles: [],
+    profiles: r.profiles ?? [],
   }));
 }

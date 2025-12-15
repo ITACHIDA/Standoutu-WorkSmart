@@ -56,6 +56,43 @@ type FillPlanResult = {
   blocked?: string[];
 };
 
+function trimString(val: unknown): string {
+  if (typeof val === 'string') return val.trim();
+  if (typeof val === 'number') return String(val);
+  return '';
+}
+
+function formatPhone(contact?: BaseInfo['contact']) {
+  if (!contact) return '';
+  const parts = [contact.phoneCode, contact.phoneNumber].map(trimString).filter(Boolean);
+  const combined = parts.join(' ').trim();
+  const fallback = trimString(contact.phone);
+  return combined || fallback;
+}
+
+function mergeBaseInfo(existing?: BaseInfo, incoming?: Partial<BaseInfo>): BaseInfo {
+  const current = existing ?? {};
+  const next = incoming ?? {};
+  const merged: BaseInfo = {
+    ...current,
+    ...next,
+    name: { ...(current.name ?? {}), ...(next.name ?? {}) },
+    contact: { ...(current.contact ?? {}), ...(next.contact ?? {}) },
+    location: { ...(current.location ?? {}), ...(next.location ?? {}) },
+    workAuth: { ...(current.workAuth ?? {}), ...(next.workAuth ?? {}) },
+    links: { ...(current.links ?? {}), ...(next.links ?? {}) },
+    career: { ...(current.career ?? {}), ...(next.career ?? {}) },
+    education: { ...(current.education ?? {}), ...(next.education ?? {}) },
+    preferences: { ...(current.preferences ?? {}), ...(next.preferences ?? {}) },
+    defaultAnswers: { ...(current.defaultAnswers ?? {}), ...(next.defaultAnswers ?? {}) },
+  };
+  const phone = formatPhone(merged.contact);
+  if (phone) {
+    merged.contact = { ...(merged.contact ?? {}), phone };
+  }
+  return merged;
+}
+
 function sanitizeText(input: string | undefined | null) {
   if (!input) return '';
   return input.replace(/\u0000/g, '');
@@ -606,13 +643,26 @@ async function applyFillPlan(page: Page, plan: any[]): Promise<FillPlanResult> {
 
 async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any): Promise<FillPlanResult> {
   const fullName = [baseInfo?.name?.first, baseInfo?.name?.last].filter(Boolean).join(' ').trim();
-  const email = baseInfo?.contact?.email;
-  const phone = baseInfo?.contact?.phone;
-  const city = baseInfo?.location?.city;
-  const country = baseInfo?.location?.country;
-  const linkedin = baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin;
-  const company = parsedResume?.experience?.[0]?.company;
-  const title = parsedResume?.experience?.[0]?.title;
+  const email = trimString(baseInfo?.contact?.email);
+  const phoneCode = trimString(baseInfo?.contact?.phoneCode);
+  const phoneNumber = trimString(baseInfo?.contact?.phoneNumber);
+  const phone = formatPhone(baseInfo?.contact);
+  const address = trimString(baseInfo?.location?.address);
+  const city = trimString(baseInfo?.location?.city);
+  const state = trimString(baseInfo?.location?.state);
+  const country = trimString(baseInfo?.location?.country);
+  const postalCode = trimString(baseInfo?.location?.postalCode);
+  const linkedin = trimString(baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin);
+  const company = trimString(
+    baseInfo?.career?.currentCompany || parsedResume?.experience?.[0]?.company || parsedResume?.experience?.[0]?.employer,
+  );
+  const title = trimString(baseInfo?.career?.jobTitle || parsedResume?.experience?.[0]?.title);
+  const yearsExp = trimString(baseInfo?.career?.yearsExp ?? parsedResume?.years_experience_general);
+  const desiredSalary = trimString(baseInfo?.career?.desiredSalary);
+  const school = trimString(baseInfo?.education?.school);
+  const degree = trimString(baseInfo?.education?.degree);
+  const majorField = trimString(baseInfo?.education?.majorField);
+  const graduationAt = trimString(baseInfo?.education?.graduationAt);
 
   const filled: { field: string; value: string; confidence?: number }[] = [];
   const targets = [
@@ -620,12 +670,23 @@ async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any
     { key: 'first', match: /first/i, value: baseInfo?.name?.first },
     { key: 'last', match: /last/i, value: baseInfo?.name?.last },
     { key: 'email', match: /email/i, value: email },
+    { key: 'phone_code', match: /(phone|mobile).*(code)|country\s*code|dial\s*code/i, value: phoneCode },
+    { key: 'phone_number', match: /(phone|mobile).*(number|no\.)/i, value: phoneNumber },
     { key: 'phone', match: /phone|tel/i, value: phone },
+    { key: 'address', match: /address/i, value: address },
     { key: 'city', match: /city/i, value: city },
+    { key: 'state', match: /state|province|region/i, value: state },
     { key: 'country', match: /country|nation/i, value: country },
+    { key: 'postal_code', match: /postal|zip/i, value: postalCode },
     { key: 'company', match: /company|employer/i, value: company },
     { key: 'title', match: /title|position|role/i, value: title },
+    { key: 'years_experience', match: /years?.*experience|experience.*years|yrs/i, value: yearsExp },
+    { key: 'desired_salary', match: /salary|compensation|pay|rate/i, value: desiredSalary },
     { key: 'linkedin', match: /linkedin|linked\s*in/i, value: linkedin },
+    { key: 'school', match: /school|university|college/i, value: school },
+    { key: 'degree', match: /degree|diploma/i, value: degree },
+    { key: 'major_field', match: /major|field\s*of\s*study/i, value: majorField },
+    { key: 'graduation_at', match: /grad/i, value: graduationAt },
   ].filter((t) => t.value);
 
   const inputs = await page.$$('input, textarea, select');
@@ -676,9 +737,23 @@ const DEFAULT_AUTOFILL_FIELDS = [
   { field_id: 'first_name', label: 'First name', type: 'text', required: true },
   { field_id: 'last_name', label: 'Last name', type: 'text', required: true },
   { field_id: 'email', label: 'Email', type: 'text', required: true },
+  { field_id: 'phone_code', label: 'Phone code', type: 'text', required: false },
+  { field_id: 'phone_number', label: 'Phone number', type: 'text', required: false },
   { field_id: 'phone', label: 'Phone', type: 'text', required: false },
+  { field_id: 'address', label: 'Address', type: 'text', required: false },
   { field_id: 'city', label: 'City', type: 'text', required: false },
+  { field_id: 'state', label: 'State/Province', type: 'text', required: false },
   { field_id: 'country', label: 'Country', type: 'text', required: false },
+  { field_id: 'postal_code', label: 'Postal code', type: 'text', required: false },
+  { field_id: 'linkedin', label: 'LinkedIn', type: 'text', required: false },
+  { field_id: 'job_title', label: 'Job title', type: 'text', required: false },
+  { field_id: 'current_company', label: 'Current company', type: 'text', required: false },
+  { field_id: 'years_exp', label: 'Years of experience', type: 'number', required: false },
+  { field_id: 'desired_salary', label: 'Desired salary', type: 'text', required: false },
+  { field_id: 'school', label: 'School', type: 'text', required: false },
+  { field_id: 'degree', label: 'Degree', type: 'text', required: false },
+  { field_id: 'major_field', label: 'Major/Field', type: 'text', required: false },
+  { field_id: 'graduation_at', label: 'Graduation date', type: 'text', required: false },
   { field_id: 'work_auth', label: 'Authorized to work?', type: 'checkbox', required: false },
   {
     field_id: 'cover_letter',
@@ -762,17 +837,27 @@ async function bootstrap() {
   app.get('/profiles', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    const queryUserId = (request.query as { userId?: string }).userId;
-    const targetUser = actor ?? (queryUserId ? await findUserById(queryUserId) : undefined);
-    if (!targetUser || !targetUser.isActive) return [];
+    if (!actor || actor.isActive === false) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
 
-    if (targetUser.role === 'ADMIN' || targetUser.role === 'MANAGER') {
+    const { userId } = request.query as { userId?: string };
+
+    if (actor.role === 'ADMIN' || actor.role === 'MANAGER') {
+      if (userId) {
+        const target = await findUserById(userId);
+        if (target?.role === 'BIDDER' && target.isActive !== false) {
+          return listProfilesForBidder(target.id);
+        }
+      }
       return listProfiles();
     }
-    if (targetUser.role === 'BIDDER') {
-      return listProfilesForBidder(targetUser.id);
+
+    if (actor.role === 'BIDDER') {
+      return listProfilesForBidder(actor.id);
     }
-    return [];
+
+    return reply.status(403).send({ message: 'Forbidden' });
   });
 
   app.post('/profiles', async (request, reply) => {
@@ -783,17 +868,68 @@ async function bootstrap() {
     }
     const schema = z.object({
       displayName: z.string().min(2),
+      baseInfo: z.record(z.any()).optional(),
       firstName: z.string().optional(),
       lastName: z.string().optional(),
       email: z.string().email().optional(),
+      phoneCode: z.string().optional(),
+      phoneNumber: z.string().optional(),
+      address: z.string().optional(),
+      city: z.string().optional(),
+      state: z.string().optional(),
+      country: z.string().optional(),
+      postalCode: z.string().optional(),
+      linkedin: z.string().optional(),
+      jobTitle: z.string().optional(),
+      currentCompany: z.string().optional(),
+      yearsExp: z.union([z.string(), z.number()]).optional(),
+      desiredSalary: z.string().optional(),
+      school: z.string().optional(),
+      degree: z.string().optional(),
+      majorField: z.string().optional(),
+      graduationAt: z.string().optional(),
     });
     const body = schema.parse(request.body);
     const profileId = randomUUID();
     const now = new Date().toISOString();
-    const baseInfo = {
-      name: { first: body.firstName ?? '', last: body.lastName ?? '' },
-      contact: { email: body.email ?? '' },
-    };
+    const incomingBase = (body.baseInfo ?? {}) as BaseInfo;
+    const baseInfo = mergeBaseInfo({}, {
+      ...incomingBase,
+      name: {
+        ...(incomingBase.name ?? {}),
+        first: trimString(body.firstName ?? incomingBase.name?.first),
+        last: trimString(body.lastName ?? incomingBase.name?.last),
+      },
+      contact: {
+        ...(incomingBase.contact ?? {}),
+        email: trimString(body.email ?? incomingBase.contact?.email),
+        phoneCode: trimString(body.phoneCode ?? incomingBase.contact?.phoneCode),
+        phoneNumber: trimString(body.phoneNumber ?? incomingBase.contact?.phoneNumber),
+      },
+      location: {
+        ...(incomingBase.location ?? {}),
+        address: trimString(body.address ?? incomingBase.location?.address),
+        city: trimString(body.city ?? incomingBase.location?.city),
+        state: trimString(body.state ?? incomingBase.location?.state),
+        country: trimString(body.country ?? incomingBase.location?.country),
+        postalCode: trimString(body.postalCode ?? incomingBase.location?.postalCode),
+      },
+      links: { ...(incomingBase.links ?? {}), linkedin: trimString(body.linkedin ?? (incomingBase.links as any)?.linkedin) },
+      career: {
+        ...(incomingBase.career ?? {}),
+        jobTitle: trimString(body.jobTitle ?? incomingBase.career?.jobTitle),
+        currentCompany: trimString(body.currentCompany ?? incomingBase.career?.currentCompany),
+        yearsExp: body.yearsExp ?? incomingBase.career?.yearsExp,
+        desiredSalary: trimString(body.desiredSalary ?? incomingBase.career?.desiredSalary),
+      },
+      education: {
+        ...(incomingBase.education ?? {}),
+        school: trimString(body.school ?? incomingBase.education?.school),
+        degree: trimString(body.degree ?? incomingBase.education?.degree),
+        majorField: trimString(body.majorField ?? incomingBase.education?.majorField),
+        graduationAt: trimString(body.graduationAt ?? incomingBase.education?.graduationAt),
+      },
+    });
     const profile = {
       id: profileId,
       displayName: body.displayName,
@@ -822,20 +958,8 @@ async function bootstrap() {
     });
     const body = schema.parse(request.body ?? {});
 
-    const incomingBase = (body.baseInfo ?? {}) as any;
-    const mergedBase = {
-      ...(existing.baseInfo ?? {}),
-      ...(incomingBase || {}),
-      name: { ...(existing.baseInfo?.name ?? {}), ...(incomingBase?.name ?? {}) },
-      contact: { ...(existing.baseInfo?.contact ?? {}), ...(incomingBase?.contact ?? {}) },
-      location: { ...(existing.baseInfo?.location ?? {}), ...(incomingBase?.location ?? {}) },
-      workAuth: { ...(existing.baseInfo?.workAuth ?? {}), ...(incomingBase?.workAuth ?? {}) },
-      links: { ...(existing.baseInfo?.links ?? {}), ...(incomingBase?.links ?? {}) },
-      defaultAnswers: {
-        ...(existing.baseInfo?.defaultAnswers ?? {}),
-        ...(incomingBase?.defaultAnswers ?? {}),
-      },
-    };
+    const incomingBase = (body.baseInfo ?? {}) as BaseInfo;
+    const mergedBase = mergeBaseInfo(existing.baseInfo, incomingBase);
 
     const updatedProfile = {
       ...existing,
@@ -1042,6 +1166,10 @@ async function bootstrap() {
 
   app.post('/sessions', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || actor.isActive === false) {
+      return reply.status(401).send({ message: 'Unauthorized' });
+    }
     const schema = z.object({
       bidderUserId: z.string(),
       profileId: z.string(),
@@ -1050,12 +1178,23 @@ async function bootstrap() {
     });
     const body = schema.parse(request.body);
     const profileAssignment = await findActiveAssignmentByProfile(body.profileId);
-    if (profileAssignment && profileAssignment.bidderUserId !== body.bidderUserId) {
-      return reply.status(403).send({ message: 'Profile not assigned to bidder' });
+
+    let bidderUserId = body.bidderUserId;
+    if (actor.role === 'BIDDER') {
+      bidderUserId = actor.id;
+      if (profileAssignment && profileAssignment.bidderUserId !== actor.id) {
+        return reply.status(403).send({ message: 'Profile not assigned to bidder' });
+      }
+    } else if (actor.role === 'MANAGER' || actor.role === 'ADMIN') {
+      if (!bidderUserId && profileAssignment) bidderUserId = profileAssignment.bidderUserId;
+      if (!bidderUserId) bidderUserId = actor.id;
+    } else {
+      return reply.status(403).send({ message: 'Forbidden' });
     }
+
     const session: ApplicationSession = {
       id: randomUUID(),
-      bidderUserId: body.bidderUserId,
+      bidderUserId,
       profileId: body.profileId,
       url: body.url,
       domain: tryExtractDomain(body.url),
@@ -1521,11 +1660,28 @@ function tryExtractDomain(url: string) {
 }
 
 function buildDemoFillPlan(baseInfo: BaseInfo): FillPlanResult {
+  const phone = formatPhone(baseInfo?.contact);
   const safeFields = [
     { field: 'first_name', value: baseInfo?.name?.first, confidence: 0.98 },
     { field: 'last_name', value: baseInfo?.name?.last, confidence: 0.98 },
     { field: 'email', value: baseInfo?.contact?.email, confidence: 0.97 },
-    { field: 'phone', value: baseInfo?.contact?.phone, confidence: 0.8 },
+    { field: 'phone_code', value: baseInfo?.contact?.phoneCode, confidence: 0.75 },
+    { field: 'phone_number', value: baseInfo?.contact?.phoneNumber, confidence: 0.78 },
+    { field: 'phone', value: phone, confidence: 0.8 },
+    { field: 'address', value: baseInfo?.location?.address, confidence: 0.75 },
+    { field: 'city', value: baseInfo?.location?.city, confidence: 0.75 },
+    { field: 'state', value: baseInfo?.location?.state, confidence: 0.72 },
+    { field: 'country', value: baseInfo?.location?.country, confidence: 0.72 },
+    { field: 'postal_code', value: baseInfo?.location?.postalCode, confidence: 0.72 },
+    { field: 'linkedin', value: baseInfo?.links?.linkedin, confidence: 0.78 },
+    { field: 'job_title', value: baseInfo?.career?.jobTitle, confidence: 0.7 },
+    { field: 'current_company', value: baseInfo?.career?.currentCompany, confidence: 0.68 },
+    { field: 'years_exp', value: baseInfo?.career?.yearsExp, confidence: 0.6 },
+    { field: 'desired_salary', value: baseInfo?.career?.desiredSalary, confidence: 0.62 },
+    { field: 'school', value: baseInfo?.education?.school, confidence: 0.66 },
+    { field: 'degree', value: baseInfo?.education?.degree, confidence: 0.65 },
+    { field: 'major_field', value: baseInfo?.education?.majorField, confidence: 0.64 },
+    { field: 'graduation_at', value: baseInfo?.education?.graduationAt, confidence: 0.6 },
   ];
   const filled = safeFields
     .filter((f) => Boolean(f.value))

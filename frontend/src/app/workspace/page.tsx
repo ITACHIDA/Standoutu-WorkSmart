@@ -1,7 +1,7 @@
 'use client';
 /* eslint-disable @next/next/no-img-element */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
 import TopNav from "../../components/TopNav";
 
@@ -20,10 +20,13 @@ type User = {
 
 type BaseInfo = {
   name?: { first?: string; last?: string };
-  contact?: { email?: string; phone?: string };
-  links?: Record<string, string>;
-  location?: { city?: string; country?: string };
+  contact?: { email?: string; phone?: string; phoneCode?: string; phoneNumber?: string };
+  links?: Record<string, string> & { linkedin?: string };
+  location?: { address?: string; city?: string; state?: string; country?: string; postalCode?: string };
+  career?: { jobTitle?: string; currentCompany?: string; yearsExp?: string | number; desiredSalary?: string };
+  education?: { school?: string; degree?: string; majorField?: string; graduationAt?: string };
   workAuth?: { authorized?: boolean; needsSponsorship?: boolean };
+  preferences?: Record<string, unknown>;
   defaultAnswers?: Record<string, string>;
 };
 
@@ -31,6 +34,7 @@ type Profile = {
   id: string;
   displayName: string;
   baseInfo: BaseInfo;
+  assignedBidderId?: string;
 };
 
 type Resume = {
@@ -154,8 +158,8 @@ export default function Page() {
   const [streamConnected, setStreamConnected] = useState(false);
   const [analyzePopup, setAnalyzePopup] = useState<AnalyzePopupState | null>(null);
   const [useAiAnalyze, setUseAiAnalyze] = useState(false);
-  const [editingBaseInfo, setEditingBaseInfo] = useState(false);
-  const [draftBaseInfo, setDraftBaseInfo] = useState<BaseInfo>({});
+  const [showBaseInfo, setShowBaseInfo] = useState(false);
+  const [baseInfoView, setBaseInfoView] = useState<BaseInfo>(() => cleanBaseInfo({}));
   const [webviewStatus, setWebviewStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle");
   const webviewRef = useRef<Element | null>(null);
   const [isClient, setIsClient] = useState(false);
@@ -200,6 +204,7 @@ export default function Page() {
   const filledFields = fillPlan?.filled ?? [];
   const fillSuggestions = fillPlan?.suggestions ?? [];
   const fillBlocked = fillPlan?.blocked ?? [];
+  const baseDraft = cleanBaseInfo(baseInfoView);
 
   async function loadResumes(profileId: string) {
     try {
@@ -235,9 +240,9 @@ export default function Page() {
     setRecommended(null);
     setStreamFrame("");
     setStreamConnected(false);
-    setEditingBaseInfo(false);
     const base = profiles.find((p) => p.id === selectedProfileId)?.baseInfo;
-    setDraftBaseInfo(base ?? {});
+    setBaseInfoView(cleanBaseInfo(base ?? {}));
+    setShowBaseInfo(false);
   }, [selectedProfileId, user, profiles]);
 
   useEffect(() => {
@@ -414,51 +419,21 @@ export default function Page() {
     }
   }
 
-  function updateDraftBaseInfo(path: string, value: string | boolean) {
-    setDraftBaseInfo((prev) => {
-      const next = { ...prev };
-      if (path.startsWith("name.")) {
-        const key = path.split(".")[1];
-        next.name = { ...(prev.name ?? {}), [key]: value as string };
-      } else if (path.startsWith("contact.")) {
-        const key = path.split(".")[1];
-        next.contact = { ...(prev.contact ?? {}), [key]: value as string };
-      } else if (path.startsWith("location.")) {
-        const key = path.split(".")[1];
-        next.location = { ...(prev.location ?? {}), [key]: value as string };
-      } else if (path === "workAuth.authorized") {
-        next.workAuth = { ...(prev.workAuth ?? {}), authorized: Boolean(value) };
-      }
-      return next;
-    });
-  }
-
-  function handleSaveBaseInfo() {
-    if (!selectedProfileId) return;
-    setProfiles((prev) =>
-      prev.map((p) =>
-        p.id === selectedProfileId ? { ...p, baseInfo: draftBaseInfo } : p
-      )
-    );
-    setEditingBaseInfo(false);
-  }
-
-  function handleCancelBaseInfo() {
-    setDraftBaseInfo(selectedProfile?.baseInfo ?? {});
-    setEditingBaseInfo(false);
-  }
-
   useEffect(() => {
     const fetchForUser = async () => {
       if (!user || user.role === "OBSERVER") return;
       try {
-        const profs: Profile[] = await api(`/profiles?userId=${user.id}`);
+        const profs: Profile[] = await api(`/profiles`);
         const visible =
           user.role === "BIDDER"
-            ? profs.filter((p: any) => p.assignedBidderId === user.id)
+            ? profs.filter((p) => p.assignedBidderId === user.id)
             : profs;
-        setProfiles(visible);
-        const defaultProfileId = visible[0]?.id ?? "";
+        const normalized = visible.map((p) => ({
+          ...p,
+          baseInfo: cleanBaseInfo(p.baseInfo ?? {}),
+        }));
+        setProfiles(normalized);
+        const defaultProfileId = normalized[0]?.id ?? "";
         setSelectedProfileId(defaultProfileId);
         void refreshMetrics(user.id);
         if (defaultProfileId) {
@@ -912,120 +887,40 @@ export default function Page() {
             <div className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3">
               <div className="flex items-center justify-between">
                 <p className="text-sm font-semibold">Profile base info</p>
-                {!editingBaseInfo ? (
-                  <button
-                    className="text-xs text-[#5ef3c5] hover:underline"
-                    onClick={() => {
-                      setDraftBaseInfo(selectedProfile?.baseInfo ?? {});
-                      setEditingBaseInfo(true);
-                    }}
-                  >
-                    Edit
-                  </button>
-                ) : (
-                  <div className="flex gap-2 text-xs">
-                    <button
-                      className="rounded-lg bg-[#5ef3c5] px-3 py-1 font-semibold text-[#0b1224]"
-                      onClick={handleSaveBaseInfo}
-                    >
-                      Save
-                    </button>
-                    <button
-                      className="rounded-lg bg-white/10 px-3 py-1 text-slate-900"
-                      onClick={handleCancelBaseInfo}
-                    >
-                      Cancel
-                    </button>
-                  </div>
-                )}
+                <button
+                  className="flex h-8 w-8 items-center justify-center rounded-full border border-slate-200 bg-white text-slate-800 shadow-sm transition hover:bg-slate-100"
+                  title={showBaseInfo ? "Hide base info" : "Show base info"}
+                  onClick={() => setShowBaseInfo((v) => !v)}
+                >
+                  <TriangleIcon direction={showBaseInfo ? "down" : "left"} />
+                  <span className="sr-only">{showBaseInfo ? "Hide base info" : "Show base info"}</span>
+                </button>
               </div>
-              <div className="space-y-2 text-sm text-slate-800">
-                <EditableRow
-                  label="Name"
-                  editing={editingBaseInfo}
-                  value={`${draftBaseInfo?.name?.first ?? ""} ${draftBaseInfo?.name?.last ?? ""}`.trim() || "N/A"}
-                >
-                  <div className="grid grid-cols-2 gap-2">
-                    <input
-                      value={draftBaseInfo?.name?.first ?? ""}
-                      onChange={(e) => updateDraftBaseInfo("name.first", e.target.value)}
-                      placeholder="First"
-                      className="rounded-lg bg-slate-100 px-3 py-2 text-sm outline-none ring-1 ring-white/10"
-                    />
-                    <input
-                      value={draftBaseInfo?.name?.last ?? ""}
-                      onChange={(e) => updateDraftBaseInfo("name.last", e.target.value)}
-                      placeholder="Last"
-                      className="rounded-lg bg-slate-100 px-3 py-2 text-sm outline-none ring-1 ring-white/10"
-                    />
-                  </div>
-                </EditableRow>
-                <EditableRow
-                  label="Email"
-                  editing={editingBaseInfo}
-                  value={draftBaseInfo?.contact?.email ?? "N/A"}
-                >
-                  <input
-                    value={draftBaseInfo?.contact?.email ?? ""}
-                    onChange={(e) => updateDraftBaseInfo("contact.email", e.target.value)}
-                    className="w-full rounded-lg bg-slate-100 px-3 py-2 text-sm outline-none ring-1 ring-white/10"
-                  />
-                </EditableRow>
-                <EditableRow
-                  label="Phone"
-                  editing={editingBaseInfo}
-                  value={draftBaseInfo?.contact?.phone ?? "N/A"}
-                >
-                  <input
-                    value={draftBaseInfo?.contact?.phone ?? ""}
-                    onChange={(e) => updateDraftBaseInfo("contact.phone", e.target.value)}
-                    className="w-full rounded-lg bg-slate-100 px-3 py-2 text-sm outline-none ring-1 ring-white/10"
-                  />
-                </EditableRow>
-                <EditableRow
-                  label="Location"
-                  editing={editingBaseInfo}
-                  value={
-                    draftBaseInfo?.location
-                      ? `${draftBaseInfo.location.city ?? ""}, ${draftBaseInfo.location.country ?? ""}`
-                      : "N/A"
-                  }
-                >
-                  <div className="grid grid-cols-2 gap-2">
-                    <input
-                      value={draftBaseInfo?.location?.city ?? ""}
-                      onChange={(e) => updateDraftBaseInfo("location.city", e.target.value)}
-                      placeholder="City"
-                      className="rounded-lg bg-slate-100 px-3 py-2 text-sm outline-none ring-1 ring-white/10"
-                    />
-                    <input
-                      value={draftBaseInfo?.location?.country ?? ""}
-                      onChange={(e) => updateDraftBaseInfo("location.country", e.target.value)}
-                      placeholder="Country"
-                      className="rounded-lg bg-slate-100 px-3 py-2 text-sm outline-none ring-1 ring-white/10"
-                    />
-                  </div>
-                </EditableRow>
-                <EditableRow
-                  label="Work auth"
-                  editing={editingBaseInfo}
-                  value={
-                    draftBaseInfo?.workAuth?.authorized ? "Authorized" : "Unknown"
-                  }
-                >
-                  <label className="flex items-center gap-2 text-sm text-slate-800">
-                    <input
-                      type="checkbox"
-                      checked={Boolean(draftBaseInfo?.workAuth?.authorized)}
-                      onChange={(e) =>
-                        updateDraftBaseInfo("workAuth.authorized", e.target.checked)
-                      }
-                      className="h-4 w-4 rounded border-white/30 bg-slate-100"
-                    />
-                    Authorized to work
-                  </label>
-                </EditableRow>
-              </div>
+              {showBaseInfo ? (
+                <div className="space-y-2 text-sm text-slate-800">
+                  <EditableRow label="First name" editing={false} value={baseDraft?.name?.first || "N/A"} />
+                  <EditableRow label="Last name" editing={false} value={baseDraft?.name?.last || "N/A"} />
+                  <EditableRow label="Email" editing={false} value={baseDraft?.contact?.email || "N/A"} />
+                  <EditableRow label="Phone code" editing={false} value={baseDraft?.contact?.phoneCode || "N/A"} />
+                  <EditableRow label="Phone number" editing={false} value={baseDraft?.contact?.phoneNumber || "N/A"} />
+                  <EditableRow label="Phone (combined)" editing={false} value={formatPhone(baseDraft.contact) || "N/A"} />
+                  <EditableRow label="LinkedIn" editing={false} value={baseDraft?.links?.linkedin || "N/A"} />
+                  <EditableRow label="Address" editing={false} value={baseDraft?.location?.address || "N/A"} />
+                  <EditableRow label="City" editing={false} value={baseDraft?.location?.city || "N/A"} />
+                  <EditableRow label="State / Province" editing={false} value={baseDraft?.location?.state || "N/A"} />
+                  <EditableRow label="Country" editing={false} value={baseDraft?.location?.country || "N/A"} />
+                  <EditableRow label="Postal code" editing={false} value={baseDraft?.location?.postalCode || "N/A"} />
+                  <EditableRow label="Job title" editing={false} value={baseDraft?.career?.jobTitle || "N/A"} />
+                  <EditableRow label="Current company" editing={false} value={baseDraft?.career?.currentCompany || "N/A"} />
+                  <EditableRow label="Years of experience" editing={false} value={(baseDraft?.career?.yearsExp as string) || "N/A"} />
+                  <EditableRow label="Desired salary" editing={false} value={baseDraft?.career?.desiredSalary || "N/A"} />
+                  <EditableRow label="School" editing={false} value={baseDraft?.education?.school || "N/A"} />
+                  <EditableRow label="Degree" editing={false} value={baseDraft?.education?.degree || "N/A"} />
+                  <EditableRow label="Major / field" editing={false} value={baseDraft?.education?.majorField || "N/A"} />
+                  <EditableRow label="Graduation date" editing={false} value={baseDraft?.education?.graduationAt || "N/A"} />
+                  <EditableRow label="Authorized to work" editing={false} value={baseDraft?.workAuth?.authorized ? "Yes" : "No"} />
+                </div>
+              ) : null}
             </div>
           </section>
         </div>
@@ -1129,6 +1024,65 @@ export default function Page() {
   );
 }
 
+function cleanString(val?: string | number | null) {
+  if (typeof val === "number") return String(val);
+  if (typeof val === "string") return val.trim();
+  return "";
+}
+
+function formatPhone(contact?: BaseInfo["contact"]) {
+  if (!contact) return "";
+  const parts = [contact.phoneCode, contact.phoneNumber].map((p) => cleanString(p)).filter(Boolean);
+  const combined = parts.join(" ").trim();
+  const fallback = cleanString(contact.phone);
+  return combined || fallback;
+}
+
+function cleanBaseInfo(base: BaseInfo): BaseInfo {
+  const links = { ...(base?.links ?? {}) } as Record<string, string> & { linkedin?: string };
+  if (typeof links.linkedin === "string") links.linkedin = links.linkedin.trim();
+  return {
+    name: { first: cleanString(base?.name?.first), last: cleanString(base?.name?.last) },
+    contact: {
+      email: cleanString(base?.contact?.email),
+      phone: formatPhone(base?.contact),
+      phoneCode: cleanString(base?.contact?.phoneCode),
+      phoneNumber: cleanString(base?.contact?.phoneNumber),
+    },
+    links,
+    location: {
+      address: cleanString(base?.location?.address),
+      city: cleanString(base?.location?.city),
+      state: cleanString(base?.location?.state),
+      country: cleanString(base?.location?.country),
+      postalCode: cleanString(base?.location?.postalCode),
+    },
+    career: {
+      jobTitle: cleanString(base?.career?.jobTitle),
+      currentCompany: cleanString(base?.career?.currentCompany),
+      yearsExp: cleanString(base?.career?.yearsExp as string | number | undefined),
+      desiredSalary: cleanString(base?.career?.desiredSalary),
+    },
+    education: {
+      school: cleanString(base?.education?.school),
+      degree: cleanString(base?.education?.degree),
+      majorField: cleanString(base?.education?.majorField),
+      graduationAt: cleanString(base?.education?.graduationAt),
+    },
+    workAuth: {
+      authorized: base?.workAuth?.authorized ?? false,
+      needsSponsorship: base?.workAuth?.needsSponsorship ?? false,
+    },
+    preferences: base?.preferences ?? {},
+    defaultAnswers: base?.defaultAnswers ?? {},
+  };
+}
+
+function buildBaseInfoPayload(base: BaseInfo): BaseInfo {
+  const cleaned = cleanBaseInfo(base);
+  return { ...cleaned, contact: { ...cleaned.contact, phone: formatPhone(cleaned.contact) } };
+}
+
 function formatScore(score?: number) {
   if (typeof score === "number" && Number.isFinite(score)) {
     return score.toFixed(2);
@@ -1167,6 +1121,20 @@ function StatTile({
   );
 }
 
+function TriangleIcon({ direction }: { direction: "down" | "left" }) {
+  const rotation = direction === "down" ? "rotate-0" : "rotate-90";
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      className={`h-4 w-4 fill-current ${rotation}`}
+      aria-hidden="true"
+      focusable="false"
+    >
+      <path d="M12 16.5 5 7.5h14z" />
+    </svg>
+  );
+}
+
 function EditableRow({
   label,
   value,
@@ -1176,8 +1144,8 @@ function EditableRow({
   label: string;
   value: string;
   editing: boolean;
-  children: React.ReactNode;
-}) {
+  children?: ReactNode;
+  }) {
   return (
     <div className="rounded-lg bg-white/5 px-3 py-2">
       <div className="flex items-center justify-between text-[11px] uppercase tracking-[0.18em] text-slate-700">
@@ -1185,7 +1153,7 @@ function EditableRow({
         {!editing && <span className="text-[10px] text-slate-500">View</span>}
       </div>
       <div className="mt-2 text-sm text-slate-900">
-        {editing ? children : value || "N/A"}
+        {editing ? (children ?? value ?? "N/A") : value ?? "N/A"}
       </div>
     </div>
   );

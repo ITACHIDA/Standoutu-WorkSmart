@@ -725,17 +725,23 @@ async function bootstrap() {
         if ((0, auth_1.forbidObserver)(reply, request.authUser))
             return;
         const actor = request.authUser;
-        const queryUserId = request.query.userId;
-        const targetUser = actor ?? (queryUserId ? await (0, db_1.findUserById)(queryUserId) : undefined);
-        if (!targetUser || !targetUser.isActive)
-            return [];
-        if (targetUser.role === 'ADMIN' || targetUser.role === 'MANAGER') {
+        if (!actor || actor.isActive === false) {
+            return reply.status(401).send({ message: 'Unauthorized' });
+        }
+        const { userId } = request.query;
+        if (actor.role === 'ADMIN' || actor.role === 'MANAGER') {
+            if (userId) {
+                const target = await (0, db_1.findUserById)(userId);
+                if ((target === null || target === void 0 ? void 0 : target.role) === 'BIDDER' && target.isActive !== false) {
+                    return (0, db_1.listProfilesForBidder)(target.id);
+                }
+            }
             return (0, db_1.listProfiles)();
         }
-        if (targetUser.role === 'BIDDER') {
-            return (0, db_1.listProfilesForBidder)(targetUser.id);
+        if (actor.role === 'BIDDER') {
+            return (0, db_1.listProfilesForBidder)(actor.id);
         }
-        return [];
+        return reply.status(403).send({ message: 'Forbidden' });
     });
     app.post('/profiles', async (request, reply) => {
         if ((0, auth_1.forbidObserver)(reply, request.authUser))
@@ -1006,6 +1012,10 @@ async function bootstrap() {
     app.post('/sessions', async (request, reply) => {
         if ((0, auth_1.forbidObserver)(reply, request.authUser))
             return;
+        const actor = request.authUser;
+        if (!actor || actor.isActive === false) {
+            return reply.status(401).send({ message: 'Unauthorized' });
+        }
         const schema = zod_1.z.object({
             bidderUserId: zod_1.z.string(),
             profileId: zod_1.z.string(),
@@ -1014,12 +1024,25 @@ async function bootstrap() {
         });
         const body = schema.parse(request.body);
         const profileAssignment = await (0, db_1.findActiveAssignmentByProfile)(body.profileId);
-        if (profileAssignment && profileAssignment.bidderUserId !== body.bidderUserId) {
-            return reply.status(403).send({ message: 'Profile not assigned to bidder' });
+        let bidderUserId = body.bidderUserId;
+        if (actor.role === 'BIDDER') {
+            bidderUserId = actor.id;
+            if (profileAssignment && profileAssignment.bidderUserId !== actor.id) {
+                return reply.status(403).send({ message: 'Profile not assigned to bidder' });
+            }
+        }
+        else if (actor.role === 'MANAGER' || actor.role === 'ADMIN') {
+            if (!bidderUserId && profileAssignment)
+                bidderUserId = profileAssignment.bidderUserId;
+            if (!bidderUserId)
+                bidderUserId = actor.id;
+        }
+        else {
+            return reply.status(403).send({ message: 'Forbidden' });
         }
         const session = {
             id: (0, crypto_1.randomUUID)(),
-            bidderUserId: body.bidderUserId,
+            bidderUserId,
             profileId: body.profileId,
             url: body.url,
             domain: tryExtractDomain(body.url),

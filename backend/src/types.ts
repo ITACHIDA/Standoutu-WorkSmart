@@ -10,10 +10,33 @@ export interface User {
 }
 
 export interface BaseInfo extends Record<string, unknown> {
-  name: { first: string; last: string };
-  contact: { email: string; phone?: string };
-  links?: Record<string, string>;
-  location?: { city?: string; country?: string };
+  name?: { first?: string; last?: string };
+  contact?: {
+    email?: string;
+    phone?: string;
+    phoneCode?: string;
+    phoneNumber?: string;
+  };
+  links?: Record<string, string> & { linkedin?: string };
+  location?: {
+    address?: string;
+    city?: string;
+    state?: string;
+    country?: string;
+    postalCode?: string;
+  };
+  career?: {
+    jobTitle?: string;
+    currentCompany?: string;
+    yearsExp?: number | string;
+    desiredSalary?: string;
+  };
+  education?: {
+    school?: string;
+    degree?: string;
+    majorField?: string;
+    graduationAt?: string;
+  };
   workAuth?: { authorized?: boolean; needsSponsorship?: boolean };
   preferences?: Record<string, unknown>;
   defaultAnswers?: Record<string, string>;

@@ -42,6 +42,16 @@ export interface BaseInfo extends Record<string, unknown> {
   defaultAnswers?: Record<string, string>;
 }
 
+export interface LabelAlias {
+  id: string;
+  canonicalKey: string;
+  alias: string;
+  normalizedAlias: string;
+  isBuiltin?: boolean;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 export interface Profile {
   id: string;
   displayName: string;

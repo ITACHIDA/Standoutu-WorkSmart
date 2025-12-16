@@ -273,8 +273,9 @@ export const promptBuilders = {
   buildAutofillPlanPrompt,
 };
 
-export async function analyzeJobFromUrl(
-  url: string,
+async function classifyFromText(
+  title: string | undefined,
+  text: string,
   resumesInput?: { id: string; label: string; parsed?: Record<string, unknown>; resume_text?: string }[],
 ): Promise<{
   id: string;
@@ -285,8 +286,6 @@ export async function analyzeJobFromUrl(
   title: string;
   jobText: string;
 }> {
-  const { text, title } = await fetchJobText(url);
-
   const classified = classify(title, text);
   const ranked: RankedResume[] = classified.ranked.map((r) => ({
     id: r.label,
@@ -303,4 +302,21 @@ export async function analyzeJobFromUrl(
     title: title ?? '',
     jobText: text,
   };
+}
+
+export async function analyzeJobFromUrl(
+  url: string,
+  resumesInput?: { id: string; label: string; parsed?: Record<string, unknown>; resume_text?: string }[],
+) {
+  const { text, title } = await fetchJobText(url);
+  return classifyFromText(title, text, resumesInput);
+}
+
+export async function analyzeJobFromHtml(
+  html: string,
+  pageTitle?: string,
+  resumesInput?: { id: string; label: string; parsed?: Record<string, unknown>; resume_text?: string }[],
+) {
+  const text = normalizeText(html || '');
+  return classifyFromText(pageTitle, text, resumesInput);
 }

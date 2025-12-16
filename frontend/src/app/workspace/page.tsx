@@ -145,6 +145,7 @@ export default function Page() {
   const [url, setUrl] = useState<string>(
     "https://www.wave.com/en/careers/job/5725498004/?source=LinkedIn"
   );
+  const [useLlmAutofill, setUseLlmAutofill] = useState(false);
   const [session, setSession] = useState<ApplicationSession | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [recommended, setRecommended] = useState<AnalyzeResult | null>(null);
@@ -398,7 +399,7 @@ export default function Page() {
     try {
       const res = (await api(`/sessions/${session.id}/autofill`, {
         method: "POST",
-        body: JSON.stringify({ selectedResumeId: resumeChoice || undefined }),
+        body: JSON.stringify({ selectedResumeId: resumeChoice || undefined, useLlm: useLlmAutofill }),
       })) as AutofillResponse;
       setFillPlan(res.fillPlan);
       const detected =
@@ -784,6 +785,22 @@ export default function Page() {
               <div className="flex items-center justify-between">
                 <p className="text-sm font-semibold">Autofill</p>
                 <span className="text-xs text-slate-700">Hotkey: Ctrl+Shift+F</span>
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-xs text-slate-800">
+                <span>Use LLM fallback</span>
+                <button
+                  onClick={() => setUseLlmAutofill((v) => !v)}
+                  className={`relative flex h-6 w-12 items-center rounded-full transition ${
+                    useLlmAutofill ? "bg-[#4ade80]" : "bg-slate-300"
+                  }`}
+                >
+                  <span
+                    className={`absolute top-0.5 h-5 w-5 rounded-full bg-white shadow transition ${
+                      useLlmAutofill ? "translate-x-6" : "translate-x-1"
+                    }`}
+                  />
+                  <span className="sr-only">Toggle LLM autofill</span>
+                </button>
               </div>
               <button
                 onClick={handleAutofill}

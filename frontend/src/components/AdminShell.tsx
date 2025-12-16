@@ -7,6 +7,7 @@ import TopNav from "./TopNav";
 const links = [
   { href: "/admin/users", label: "Manage users" },
   { href: "/admin/join-requests", label: "Join requests" },
+  { href: "/admin/label-aliases", label: "Label tags" },
 ];
 
 export default function AdminShell({ children }: { children: React.ReactNode }) {

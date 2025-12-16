@@ -12,30 +12,37 @@ import bcrypt from 'bcryptjs';
 import pdfParse from 'pdf-parse';
 import { extractRawText } from 'mammoth';
 import { events, llmSettings, sessions } from './data';
-import { ApplicationSession, Assignment, BaseInfo, Resume, SessionStatus, User, UserRole } from './types';
+import { ApplicationSession, Assignment, BaseInfo, LabelAlias, Resume, SessionStatus, User, UserRole } from './types';
 import { authGuard, forbidObserver, signToken } from './auth';
 import {
   closeAssignmentById,
   deleteResumeById,
   findActiveAssignmentByProfile,
+  deleteLabelAlias,
+  findLabelAliasById,
+  findLabelAliasByNormalized,
   findProfileById,
   findResumeById,
   findUserByEmail,
   findUserById,
   initDb,
   insertProfile,
+  insertLabelAlias,
   insertAssignmentRecord,
   insertResumeRecord,
   insertUser,
   listAssignments,
   listBidderSummaries,
+  listLabelAliases,
   listProfiles,
   listProfilesForBidder,
   listResumesByProfile,
   pool,
   updateProfileRecord,
+  updateLabelAliasRecord,
 } from './db';
-import { analyzeJobFromUrl, callPromptPack, promptBuilders } from './resumeClassifier';
+import { CANONICAL_LABEL_KEYS, DEFAULT_LABEL_ALIASES, buildAliasIndex, matchLabelToCanonical, normalizeLabelAlias } from './labelAliases';
+import { analyzeJobFromHtml, callPromptPack, promptBuilders } from './resumeClassifier';
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
 const app = fastify({ logger: true });
@@ -91,6 +98,88 @@ function mergeBaseInfo(existing?: BaseInfo, incoming?: Partial<BaseInfo>): BaseI
     merged.contact = { ...(merged.contact ?? {}), phone };
   }
   return merged;
+}
+
+function parseSalaryNumber(input?: string | number | null) {
+  if (typeof input === 'number' && Number.isFinite(input)) return input;
+  if (typeof input !== 'string') return undefined;
+  const cleaned = input.replace(/[, ]+/g, '').replace(/[^0-9.]/g, '');
+  if (!cleaned) return undefined;
+  const parsed = Number(cleaned);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function computeHourlyRate(desiredSalary?: string | number | null) {
+  const annual = parseSalaryNumber(desiredSalary);
+  if (!annual || annual <= 0) return undefined;
+  return Math.floor(annual / 12 / 160);
+}
+
+function buildAutofillValueMap(
+  baseInfo: BaseInfo,
+  jobContext?: Record<string, unknown>,
+  parsedResume?: any,
+): Record<string, string> {
+  const firstName = trimString(baseInfo?.name?.first);
+  const lastName = trimString(baseInfo?.name?.last);
+  const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+  const email = trimString(baseInfo?.contact?.email);
+  const phoneCode = trimString(baseInfo?.contact?.phoneCode);
+  const phoneNumber = trimString(baseInfo?.contact?.phoneNumber);
+  const formattedPhone = phoneCode && phoneNumber ? `${phoneCode} ${phoneNumber}`.trim() : formatPhone(baseInfo?.contact);
+  const address = trimString(baseInfo?.location?.address);
+  const city = trimString(baseInfo?.location?.city);
+  const state = trimString(baseInfo?.location?.state);
+  const country = trimString(baseInfo?.location?.country);
+  const postalCode = trimString(baseInfo?.location?.postalCode);
+  const linkedin = trimString(baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin);
+  const jobTitle = trimString(baseInfo?.career?.jobTitle) || trimString((jobContext as any)?.job_title);
+  const currentCompany =
+    trimString(baseInfo?.career?.currentCompany) || trimString((jobContext as any)?.company) || trimString((jobContext as any)?.employer);
+  const yearsExp = trimString(baseInfo?.career?.yearsExp ?? parsedResume?.years_experience_general);
+  const desiredSalary = trimString(baseInfo?.career?.desiredSalary);
+  const hourlyRate = computeHourlyRate(desiredSalary);
+  const school = trimString(baseInfo?.education?.school);
+  const degree = trimString(baseInfo?.education?.degree);
+  const majorField = trimString(baseInfo?.education?.majorField);
+  const graduationDate = trimString(baseInfo?.education?.graduationAt);
+  const currentLocation = [city, state, country].filter(Boolean).join(', ');
+  const phoneCountryCode =
+    phoneCode || (formattedPhone.startsWith('+') ? formattedPhone.split(/\s+/)[0] : trimString(baseInfo?.contact?.phone));
+
+  const values: Record<string, string> = {
+    full_name: fullName,
+    first_name: firstName,
+    last_name: lastName,
+    preferred_name: firstName || fullName,
+    pronouns: 'Mr',
+    email,
+    phone: formattedPhone,
+    phone_country_code: phoneCountryCode,
+    address_line1: address,
+    city,
+    state_province_region: state,
+    postal_code: postalCode,
+    country,
+    current_location: currentLocation,
+    linkedin_url: linkedin,
+    job_title: jobTitle,
+    current_company: currentCompany,
+    years_experience: yearsExp,
+    desired_salary: desiredSalary,
+    hourly_rate: hourlyRate !== undefined ? String(hourlyRate) : '',
+    start_date: 'immediately',
+    notice_period: '0',
+    school,
+    degree,
+    major_field: majorField,
+    graduation_date: graduationDate,
+    eeo_gender: 'man',
+    eeo_race_ethnicity: 'white',
+    eeo_veteran: 'no veteran',
+    eeo_disability: 'no disability',
+  };
+  return values;
 }
 
 function sanitizeText(input: string | undefined | null) {
@@ -302,8 +391,9 @@ function simpleParseResume(resumeText: string) {
   };
 }
 
-async function collectPageFieldsFromFrame(frame: Frame) {
-  return frame.evaluate(() => {
+async function collectPageFieldsFromFrame(frame: Frame, meta: { frameUrl: string; frameName: string }) {
+  return frame.evaluate(
+    (frameInfo) => {
     const norm = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
     const textOf = (el?: Element | null) => norm(el?.textContent || (el as HTMLElement | null)?.innerText || '');
     const isVisible = (el: Element) => {
@@ -463,7 +553,7 @@ async function collectPageFieldsFromFrame(frame: Frame) {
 
     const controls = Array.from(
       document.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]')
-    ).slice(0, 150);
+    ).slice(0, 80);
 
     const fields: any[] = [];
     controls.forEach((el, idx) => {
@@ -495,7 +585,7 @@ async function collectPageFieldsFromFrame(frame: Frame) {
                 : tag;
 
       const promptCandidates: { source: string; text: string; score: number }[] = [];
-      if (label) promptCandidates.push({ source: 'label', text: label, score: scorePrompt(label, 'label') });
+      if (label) promptCandidates.push({ source: 'label', text: label, score: scorePrompt(label, 'label') + 8 });
       if (ariaName) promptCandidates.push({ source: 'aria', text: ariaName, score: scorePrompt(ariaName, 'aria') });
       if (placeholder) {
         promptCandidates.push({
@@ -516,9 +606,10 @@ async function collectPageFieldsFromFrame(frame: Frame) {
         promptCandidates.push({ ...p, score: scorePrompt(p.text, p.source) });
       });
 
-      const best = promptCandidates
-        .filter((p) => p.text)
-        .sort((a, b) => b.score - a.score)[0];
+      const best =
+        label && promptCandidates.find((p) => p.source === 'label')
+          ? promptCandidates.find((p) => p.source === 'label')
+          : promptCandidates.filter((p) => p.text).sort((a, b) => b.score - a.score)[0];
       const questionText = best?.text || '';
       const locators = recommendedLocators(el, label || ariaName || questionText || placeholder);
 
@@ -567,19 +658,26 @@ async function collectPageFieldsFromFrame(frame: Frame) {
         selector: locators.css,
         likelyEssay,
         containerPrompts: nearbyPrompts,
+        frameUrl: frameInfo.frameUrl,
+        frameName: frameInfo.frameName,
       });
     });
 
     return fields;
-  });
+  },
+    { frameUrl: meta.frameUrl, frameName: meta.frameName },
+  );
 }
 
 async function collectPageFields(page: Page) {
   const frames = page.frames();
   const results = await Promise.all(
-    frames.map(async (frame) => {
+    frames.map(async (frame, idx) => {
       try {
-        return await collectPageFieldsFromFrame(frame);
+        return await collectPageFieldsFromFrame(frame, {
+          frameUrl: frame.url(),
+          frameName: frame.name() || `frame-${idx}`,
+        });
       } catch (err) {
         console.error('collectPageFields frame failed', err);
         return [];
@@ -591,7 +689,10 @@ async function collectPageFields(page: Page) {
 
   // fallback to main frame attempt
   try {
-    return await collectPageFieldsFromFrame(page.mainFrame());
+    return await collectPageFieldsFromFrame(page.mainFrame(), {
+      frameUrl: page.mainFrame().url(),
+      frameName: page.mainFrame().name() || 'main',
+    });
   } catch {
     return [];
   }
@@ -639,6 +740,141 @@ async function applyFillPlan(page: Page, plan: any[]): Promise<FillPlanResult> {
     }
   }
   return { filled, suggestions, blocked };
+}
+
+function collectLabelCandidates(field: any): string[] {
+  const candidates: string[] = [];
+  const primaryPrompt = Array.isArray(field?.questionCandidates) && field.questionCandidates.length > 0
+    ? field.questionCandidates[0].text
+    : undefined;
+  [primaryPrompt, field?.questionText, field?.label, field?.ariaName, field?.placeholder, field?.describedBy, field?.field_id, field?.name, field?.id]
+    .forEach((t) => {
+      if (typeof t === 'string' && t.trim()) candidates.push(t);
+    });
+  if (Array.isArray(field?.containerPrompts)) {
+    field.containerPrompts.forEach((p: any) => {
+      if (p?.text && typeof p.text === 'string' && p.text.trim()) candidates.push(p.text);
+    });
+  }
+  return candidates;
+}
+
+const SKIP_KEYS = new Set(['cover_letter']);
+
+async function fillFieldsWithAliases(
+  page: Page | undefined | null,
+  fields: any[],
+  aliasIndex: Map<string, string>,
+  valueMap: Record<string, string>,
+): Promise<FillPlanResult> {
+  const filled: { field: string; value: string; confidence?: number }[] = [];
+  const suggestions: { field: string; suggestion: string }[] = [];
+  const blocked: string[] = [];
+  const seen = new Set<string>();
+
+  for (const field of fields ?? []) {
+    const candidates = collectLabelCandidates(field);
+    let matchedKey: string | undefined;
+    let matchedLabel = '';
+    for (const c of candidates) {
+      const match = matchLabelToCanonical(c, aliasIndex);
+      if (match) {
+        matchedKey = match;
+        matchedLabel = c;
+        break;
+      }
+    }
+    if (!matchedKey) continue;
+    if (SKIP_KEYS.has(matchedKey)) continue;
+
+    const value = trimString(valueMap[matchedKey]);
+    const fieldName = trimString(field?.field_id || field?.name || field?.id || matchedLabel || matchedKey) || matchedKey;
+    if (seen.has(fieldName)) continue;
+    seen.add(fieldName);
+
+    if (!value) {
+      suggestions.push({ field: fieldName, suggestion: `No data available for ${matchedKey}` });
+      continue;
+    }
+
+    const selector = field?.selector || field?.locators?.css;
+    const labelText = matchedLabel || field?.label || field?.questionText || field?.ariaName || fieldName;
+    const tryFrames = page
+      ? (() => {
+          const main = page.mainFrame();
+          const frames = page.frames().filter((f) => f !== main);
+          return [main, ...frames];
+        })()
+      : [];
+    const tryFill = async (): Promise<boolean> => {
+      if (!page || !selector) return false;
+      for (const targetFrame of tryFrames) {
+        try {
+          const trySelectByLabel = async () => targetFrame.selectOption(selector, { label: value });
+          const trySelectByValue = async () => targetFrame.selectOption(selector, { value });
+          const trySelectByGetByLabel = async () => {
+            const lbl = labelText?.trim();
+            if (!lbl) throw new Error('no label for select');
+            await targetFrame.getByLabel(lbl, { exact: false }).selectOption({ label: value }).catch(async () => {
+              await targetFrame.getByLabel(lbl, { exact: false }).selectOption({ value });
+            });
+          };
+          const tryFillByLabel = async () => {
+            const lbl = labelText?.trim();
+            if (!lbl) throw new Error('no label for fill');
+            await targetFrame.getByLabel(lbl, { exact: false }).fill(value);
+          };
+
+          if (field?.type === 'select') {
+            const opt = await targetFrame.$(selector);
+            if (opt) {
+              await trySelectByLabel()
+                .catch(trySelectByValue)
+                .catch(async () => {
+                  await targetFrame.selectOption(selector, { label: value }).catch(async () => {
+                    await targetFrame.selectOption(selector, { value }).catch(async () => {
+                      await opt.focus();
+                      await targetFrame.keyboard.type(value);
+                    });
+                  });
+                })
+                .catch(() => trySelectByGetByLabel().catch(() => {}));
+            } else {
+              await trySelectByGetByLabel();
+            }
+          } else {
+            await targetFrame.fill(selector, value).catch(async () => {
+              await tryFillByLabel();
+            });
+          }
+          return true;
+        } catch {
+          continue;
+        }
+      }
+      return false;
+    };
+
+    const success = await tryFill();
+    if (success) {
+      filled.push({ field: fieldName, value, confidence: 0.9 });
+    } else if (!page) {
+      filled.push({ field: fieldName, value, confidence: 0.75 });
+    } else {
+      blocked.push(fieldName);
+    }
+  }
+
+  return { filled, suggestions, blocked };
+}
+
+function shouldSkipPlanField(field: any, aliasIndex: Map<string, string>) {
+  const candidates = [field?.field_id, field?.label, field?.selector].filter((c) => typeof c === 'string' && c.trim());
+  for (const c of candidates) {
+    const match = matchLabelToCanonical(String(c), aliasIndex);
+    if (match && SKIP_KEYS.has(match)) return true;
+  }
+  return false;
 }
 
 async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any): Promise<FillPlanResult> {
@@ -755,13 +991,6 @@ const DEFAULT_AUTOFILL_FIELDS = [
   { field_id: 'major_field', label: 'Major/Field', type: 'text', required: false },
   { field_id: 'graduation_at', label: 'Graduation date', type: 'text', required: false },
   { field_id: 'work_auth', label: 'Authorized to work?', type: 'checkbox', required: false },
-  {
-    field_id: 'cover_letter',
-    label: 'Why are you a fit?',
-    type: 'textarea',
-    required: false,
-    surrounding_text: 'brief pitch/cover letter, keep to 2-3 sentences',
-  },
 ];
 
 // initDb, auth guard, signToken live in dedicated modules
@@ -1242,7 +1471,25 @@ async function bootstrap() {
     const body = (request.body as { useAi?: boolean } | undefined) ?? {};
     const useAi = Boolean(body.useAi);
 
-    const analysis = await analyzeJobFromUrl(session.url);
+    const live = livePages.get(id);
+    const page = live?.page;
+    if (!page) {
+      return reply.status(400).send({ message: 'Live page not available. Click Go and load the page before Analyze.' });
+    }
+
+    let pageHtml = '';
+    let pageTitle = '';
+    try {
+      pageTitle = await page.title();
+      pageHtml = await page.content();
+    } catch (err) {
+      request.log.error({ err }, 'failed to read live page content');
+    }
+    if (!pageHtml) {
+      return reply.status(400).send({ message: 'No page content captured. Load the page before Analyze.' });
+    }
+
+    const analysis = await analyzeJobFromHtml(pageHtml, pageTitle);
 
     session.status = 'ANALYZED';
     session.jobContext = {
@@ -1360,123 +1607,220 @@ async function bootstrap() {
     return parsed;
   });
 
+  app.get('/label-aliases', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || actor.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+    }
+    const custom = await listLabelAliases();
+    return { defaults: DEFAULT_LABEL_ALIASES, custom };
+  });
+
+  app.post('/label-aliases', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || actor.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+    }
+    const schema = z.object({
+      canonicalKey: z.string(),
+      alias: z.string().min(2),
+    });
+    const body = schema.parse(request.body ?? {});
+    const canonicalKey = body.canonicalKey.trim();
+    if (!CANONICAL_LABEL_KEYS.has(canonicalKey)) {
+      return reply.status(400).send({ message: 'Unknown canonical key' });
+    }
+    const normalizedAlias = normalizeLabelAlias(body.alias);
+    if (!normalizedAlias) {
+      return reply.status(400).send({ message: 'Alias cannot be empty' });
+    }
+    const existing = await findLabelAliasByNormalized(normalizedAlias);
+    if (existing) {
+      return reply.status(409).send({ message: 'Alias already exists' });
+    }
+    const aliasRecord: LabelAlias = {
+      id: randomUUID(),
+      canonicalKey,
+      alias: body.alias.trim(),
+      normalizedAlias,
+    };
+    await insertLabelAlias(aliasRecord);
+    return aliasRecord;
+  });
+
+  app.patch('/label-aliases/:id', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || actor.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+    }
+    const { id } = request.params as { id: string };
+    const schema = z.object({
+      canonicalKey: z.string().optional(),
+      alias: z.string().optional(),
+    });
+    const body = schema.parse(request.body ?? {});
+    const existing = await findLabelAliasById(id);
+    if (!existing) return reply.status(404).send({ message: 'Alias not found' });
+
+    const canonicalKey = body.canonicalKey?.trim() || existing.canonicalKey;
+    if (!CANONICAL_LABEL_KEYS.has(canonicalKey)) {
+      return reply.status(400).send({ message: 'Unknown canonical key' });
+    }
+    const aliasText = (body.alias ?? existing.alias).trim();
+    const normalizedAlias = normalizeLabelAlias(aliasText);
+    if (!normalizedAlias) {
+      return reply.status(400).send({ message: 'Alias cannot be empty' });
+    }
+    const conflict = await findLabelAliasByNormalized(normalizedAlias);
+    if (conflict && conflict.id !== id) {
+      return reply.status(409).send({ message: 'Alias already exists' });
+    }
+    const updated: LabelAlias = {
+      ...existing,
+      canonicalKey,
+      alias: aliasText,
+      normalizedAlias,
+      updatedAt: new Date().toISOString(),
+    };
+    await updateLabelAliasRecord(updated);
+    return updated;
+  });
+
+  app.delete('/label-aliases/:id', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || actor.role !== 'ADMIN') {
+      return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+    }
+    const { id } = request.params as { id: string };
+    const existing = await findLabelAliasById(id);
+    if (!existing) return reply.status(404).send({ message: 'Alias not found' });
+    await deleteLabelAlias(id);
+    return { status: 'deleted', id };
+  });
+
   app.post('/sessions/:id/autofill', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
-    const body = (request.body as { selectedResumeId?: string; pageFields?: any[] }) ?? {};
-  const session = sessions.find((s) => s.id === id);
-  if (!session) return reply.status(404).send({ message: 'Session not found' });
-  const profile = await findProfileById(session.profileId);
-  if (!profile) return reply.status(404).send({ message: 'Profile not found' });
-  if (body.selectedResumeId) {
+    const body = (request.body as { selectedResumeId?: string; pageFields?: any[]; useLlm?: boolean }) ?? {};
+    const session = sessions.find((s) => s.id === id);
+    if (!session) return reply.status(404).send({ message: 'Session not found' });
+    const profile = await findProfileById(session.profileId);
+    if (!profile) return reply.status(404).send({ message: 'Profile not found' });
+    if (body.selectedResumeId) {
       session.selectedResumeId = body.selectedResumeId;
     }
 
     const profileResumes = await listResumesByProfile(session.profileId);
-  const resumeId =
-    session.selectedResumeId ?? session.recommendedResumeId ?? body.selectedResumeId ?? profileResumes[0]?.id;
-  const resumeRecord = resumeId ? await findResumeById(resumeId) : undefined;
-  const hydratedResume = resumeRecord ? await hydrateResume(resumeRecord, profile.baseInfo) : undefined;
+    const resumeId =
+      session.selectedResumeId ?? session.recommendedResumeId ?? body.selectedResumeId ?? profileResumes[0]?.id;
+    const resumeRecord = resumeId ? await findResumeById(resumeId) : undefined;
+    const hydratedResume = resumeRecord ? await hydrateResume(resumeRecord, profile.baseInfo) : undefined;
 
-  const live = livePages.get(id);
-  const page = live?.page;
-  let pageFields: any[] = [];
-  if (page) {
-    try {
-      pageFields = await collectPageFields(page);
-    } catch (err) {
-      request.log.error({ err }, 'collectPageFields failed');
+    const live = livePages.get(id);
+    const page = live?.page;
+    let pageFields: any[] = [];
+    if (page) {
+      try {
+        pageFields = await collectPageFields(page);
+      } catch (err) {
+        request.log.error({ err }, 'collectPageFields failed');
+      }
     }
-  }
-  // Fallback: if no live page or nothing detected, spin up a fresh headless page to capture fields.
-  if ((!page || pageFields.length === 0) && session.url) {
-    try {
-      const browser = await chromium.launch({ headless: true });
-      const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-      const tmpPage = await context.newPage();
-      await tmpPage.goto(session.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-      // small settle time for dynamic renderers
-      await tmpPage.waitForTimeout(800);
-      await tmpPage
-        .waitForSelector('input, textarea, select, [contenteditable="true"], [role="textbox"]', { timeout: 5000 })
-        .catch(() => {});
-      pageFields = await collectPageFields(tmpPage);
-      await browser.close();
-    } catch (err) {
-      request.log.error({ err }, 'collectPageFields headless fallback failed');
-    }
-  }
 
-  let candidateFields: any[] =
-    Array.isArray(body.pageFields) && body.pageFields.length > 0
-      ? body.pageFields
-      : pageFields.length
-        ? pageFields
-        : DEFAULT_AUTOFILL_FIELDS;
-  let fillPlan: FillPlanResult = buildDemoFillPlan(profile.baseInfo);
-  try {
-    if (hydratedResume?.resumeText) {
-      const prompt = promptBuilders.buildAutofillPlanPrompt({
-        pageFields: candidateFields,
-        baseProfile: profile.baseInfo ?? {},
-        prefs: {},
-        jobContext: session.jobContext ?? {},
-        selectedResume: {
-          resume_id: hydratedResume.id,
-          label: hydratedResume.label,
-          parsed_resume_json: hydratedResume.parsedResume ?? {},
-          resume_text: hydratedResume.resumeText,
-        },
-        pageContext: { url: session.url },
-      });
-      const parsed = await callPromptPack(prompt);
-      const llmPlan = parsed?.result?.fill_plan;
-      if (Array.isArray(llmPlan)) {
-        const applied = page ? await applyFillPlan(page, llmPlan) : { filled: [], blocked: [], suggestions: [] };
-        const filledFromPlan = llmPlan
+    const candidateFields: any[] =
+      Array.isArray(body.pageFields) && body.pageFields.length > 0
+        ? body.pageFields
+        : pageFields.length
+          ? pageFields
+          : DEFAULT_AUTOFILL_FIELDS;
+
+    const autofillValues = buildAutofillValueMap(profile.baseInfo ?? {}, session.jobContext ?? {}, hydratedResume?.parsedResume);
+    const aliasIndex = buildAliasIndex(await listLabelAliases());
+    const useLlm = body.useLlm !== false;
+
+    let fillPlan: FillPlanResult = { filled: [], suggestions: [], blocked: [] };
+    if (candidateFields.length > 0) {
+      try {
+        fillPlan = await fillFieldsWithAliases(page, candidateFields, aliasIndex, autofillValues);
+      } catch (err) {
+        request.log.error({ err }, 'label-db autofill failed');
+        fillPlan = { filled: [], suggestions: [], blocked: [] };
+      }
+    }
+
+    try {
+      if (useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && hydratedResume?.resumeText && candidateFields.length > 0) {
+        const prompt = promptBuilders.buildAutofillPlanPrompt({
+          pageFields: candidateFields,
+          baseProfile: profile.baseInfo ?? {},
+          prefs: {},
+          jobContext: session.jobContext ?? {},
+          selectedResume: {
+            resume_id: hydratedResume.id,
+            label: hydratedResume.label,
+            parsed_resume_json: hydratedResume.parsedResume ?? {},
+            resume_text: hydratedResume.resumeText,
+          },
+          pageContext: { url: session.url },
+        });
+        const parsed = await callPromptPack(prompt);
+        const llmPlan = parsed?.result?.fill_plan;
+        if (Array.isArray(llmPlan)) {
+        const filteredPlan = llmPlan.filter((f: any) => !shouldSkipPlanField(f, aliasIndex));
+        const applied = page ? await applyFillPlan(page, filteredPlan) : { filled: [], blocked: [], suggestions: [] };
+        const filledFromPlan = filteredPlan
           .filter((f: any) => (f.action === 'fill' || f.action === 'select') && f.value)
           .map((f: any) => ({
             field: f.field_id ?? f.selector ?? f.label ?? 'field',
             value: typeof f.value === 'string' ? f.value : JSON.stringify(f.value ?? ''),
             confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
           }));
-        const suggestions =
-          (Array.isArray(parsed?.warnings) ? parsed?.warnings : []).map((w: any) => ({
-            field: 'note',
-            suggestion: String(w),
-          })) ?? [];
-        const blocked = llmPlan
-          .filter((f: any) => f.requires_user_review)
-          .map((f: any) => f.field_id ?? f.selector ?? 'field');
-        fillPlan = {
-          filled: [...filledFromPlan, ...(applied.filled ?? [])],
-          suggestions: [...suggestions, ...(applied.suggestions ?? [])],
-          blocked: [...blocked, ...(applied.blocked ?? [])],
-        };
-        if ((!fillPlan.filled || fillPlan.filled.length === 0) && page) {
-          const simple = await simplePageFill(page, profile.baseInfo, hydratedResume.parsedResume);
+          const suggestions =
+            (Array.isArray(parsed?.warnings) ? parsed?.warnings : []).map((w: any) => ({
+              field: 'note',
+              suggestion: String(w),
+            })) ?? [];
+          const blocked = llmPlan
+            .filter((f: any) => f.requires_user_review)
+            .map((f: any) => f.field_id ?? f.selector ?? 'field');
           fillPlan = {
-            filled: [...(fillPlan.filled ?? []), ...(simple.filled ?? [])],
-            suggestions: [...(fillPlan.suggestions ?? []), ...(simple.suggestions ?? [])],
-            blocked: [...(fillPlan.blocked ?? []), ...(simple.blocked ?? [])],
+            filled: [...filledFromPlan, ...(applied.filled ?? [])],
+            suggestions: [...suggestions, ...(applied.suggestions ?? [])],
+            blocked: [...blocked, ...(applied.blocked ?? [])],
           };
+          if ((!fillPlan.filled || fillPlan.filled.length === 0) && page) {
+            const simple = await simplePageFill(page, profile.baseInfo, hydratedResume.parsedResume);
+            fillPlan = {
+              filled: [...(fillPlan.filled ?? []), ...(simple.filled ?? [])],
+              suggestions: [...(fillPlan.suggestions ?? []), ...(simple.suggestions ?? [])],
+              blocked: [...(fillPlan.blocked ?? []), ...(simple.blocked ?? [])],
+            };
+          }
         }
       }
+    } catch (err) {
+      request.log.error({ err }, 'LLM autofill failed, using demo plan');
     }
-  } catch (err) {
-    request.log.error({ err }, 'LLM autofill failed, using demo plan');
-    if (page) {
+
+    if (!useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && page && candidateFields.length > 0) {
       try {
         fillPlan = await simplePageFill(page, profile.baseInfo, hydratedResume?.parsedResume);
       } catch (e) {
         request.log.error({ err: e }, 'simplePageFill failed');
       }
     }
-  }
 
-  session.status = 'FILLED';
-  session.selectedResumeId = resumeId ?? session.selectedResumeId;
-  session.fillPlan = fillPlan;
+    if (!fillPlan.filled?.length && !fillPlan.suggestions?.length && !fillPlan.blocked?.length) {
+      fillPlan = buildDemoFillPlan(profile.baseInfo);
+    }
+
+    session.status = 'FILLED';
+    session.selectedResumeId = resumeId ?? session.selectedResumeId;
+    session.fillPlan = fillPlan;
     events.push({
       id: randomUUID(),
       sessionId: id,
@@ -1614,11 +1958,14 @@ async function bootstrap() {
 
   app.get('/ws/browser/:sessionId', { websocket: true }, async (connection, req) => {
     // Allow ws without auth for now to keep demo functional
+    if (!connection || !connection.socket) {
+      return;
+    }
     const { sessionId } = req.params as { sessionId: string };
     const live = livePages.get(sessionId);
     if (!live) {
-      connection.socket.send(JSON.stringify({ type: 'error', message: 'No live browser' }));
-      connection.socket.close();
+      connection.socket?.send(JSON.stringify({ type: 'error', message: 'No live browser' }));
+      connection.socket?.close();
       return;
     }
 
@@ -1626,13 +1973,9 @@ async function bootstrap() {
     const sendFrame = async () => {
       try {
         const buf = await page.screenshot({ fullPage: true });
-        connection.socket.send(
-          JSON.stringify({ type: 'frame', data: buf.toString('base64') }),
-        );
+        connection.socket?.send(JSON.stringify({ type: 'frame', data: buf.toString('base64') }));
       } catch (err) {
-        connection.socket.send(
-          JSON.stringify({ type: 'error', message: 'Could not capture frame' }),
-        );
+        connection.socket?.send(JSON.stringify({ type: 'error', message: 'Could not capture frame' }));
       }
     };
 
@@ -1688,7 +2031,7 @@ function buildDemoFillPlan(baseInfo: BaseInfo): FillPlanResult {
     .map((f) => ({ field: f.field, value: String(f.value ?? ''), confidence: f.confidence }));
   return {
     filled,
-    suggestions: [{ field: 'cover_letter', suggestion: 'Short note about relevant skills' }],
+    suggestions: [],
     blocked: ['EEO', 'veteran_status', 'disability'],
   };
 }

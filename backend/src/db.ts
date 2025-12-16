@@ -1,5 +1,5 @@
 import { Pool } from 'pg';
-import { Assignment, Profile, Resume, User } from './types';
+import { Assignment, LabelAlias, Profile, Resume, User } from './types';
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -74,6 +74,15 @@ export async function initDb() {
         encrypted_api_key TEXT,
         chat_model TEXT,
         embed_model TEXT,
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS label_aliases (
+        id UUID PRIMARY KEY,
+        canonical_key TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        normalized_alias TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
 
@@ -379,4 +388,95 @@ export async function listBidderSummaries(): Promise<BidderSummary[]> {
     email: r.email,
     profiles: r.profiles ?? [],
   }));
+}
+
+export async function listLabelAliases(): Promise<LabelAlias[]> {
+  const { rows } = await pool.query<LabelAlias>(
+    `
+      SELECT
+        id,
+        canonical_key AS "canonicalKey",
+        alias,
+        normalized_alias AS "normalizedAlias",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM label_aliases
+      ORDER BY created_at ASC
+    `,
+  );
+  return rows;
+}
+
+export async function findLabelAliasById(id: string): Promise<LabelAlias | undefined> {
+  const { rows } = await pool.query<LabelAlias>(
+    `
+      SELECT
+        id,
+        canonical_key AS "canonicalKey",
+        alias,
+        normalized_alias AS "normalizedAlias",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM label_aliases
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [id],
+  );
+  return rows[0];
+}
+
+export async function findLabelAliasByNormalized(normalized: string): Promise<LabelAlias | undefined> {
+  const { rows } = await pool.query<LabelAlias>(
+    `
+      SELECT
+        id,
+        canonical_key AS "canonicalKey",
+        alias,
+        normalized_alias AS "normalizedAlias",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM label_aliases
+      WHERE normalized_alias = $1
+      LIMIT 1
+    `,
+    [normalized],
+  );
+  return rows[0];
+}
+
+export async function insertLabelAlias(alias: LabelAlias) {
+  await pool.query(
+    `
+      INSERT INTO label_aliases (id, canonical_key, alias, normalized_alias, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, COALESCE($5, NOW()), COALESCE($6, NOW()))
+      ON CONFLICT (normalized_alias) DO NOTHING
+    `,
+    [
+      alias.id,
+      alias.canonicalKey,
+      alias.alias,
+      alias.normalizedAlias,
+      alias.createdAt ?? new Date().toISOString(),
+      alias.updatedAt ?? new Date().toISOString(),
+    ],
+  );
+}
+
+export async function updateLabelAliasRecord(alias: LabelAlias) {
+  await pool.query(
+    `
+      UPDATE label_aliases
+      SET canonical_key = $2,
+          alias = $3,
+          normalized_alias = $4,
+          updated_at = COALESCE($5, NOW())
+      WHERE id = $1
+    `,
+    [alias.id, alias.canonicalKey, alias.alias, alias.normalizedAlias, alias.updatedAt ?? new Date().toISOString()],
+  );
+}
+
+export async function deleteLabelAlias(id: string) {
+  await pool.query('DELETE FROM label_aliases WHERE id = $1', [id]);
 }

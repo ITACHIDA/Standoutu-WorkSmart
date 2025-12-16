@@ -9,6 +9,36 @@ export interface User {
   password?: string;
 }
 
+export type CalendarProvider = 'MICROSOFT' | 'GOOGLE';
+
+export interface ProfileAccount {
+  id: string;
+  profileId: string;
+  provider: CalendarProvider;
+  email: string;
+  displayName?: string | null;
+  timezone?: string | null;
+  status?: 'ACTIVE' | 'INACTIVE';
+  lastSyncAt?: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ProfileAccountWithProfile = ProfileAccount & {
+  profileDisplayName?: string | null;
+  profileAssignedBidderId?: string | null;
+};
+
+export interface CalendarEvent {
+  id: string;
+  title: string;
+  start: string;
+  end: string;
+  isAllDay?: boolean;
+  organizer?: string;
+  location?: string;
+}
+
 export interface BaseInfo extends Record<string, unknown> {
   name?: { first?: string; last?: string };
   contact?: {

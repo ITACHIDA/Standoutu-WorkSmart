@@ -3,6 +3,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.promptBuilders = void 0;
 exports.callPromptPack = callPromptPack;
 exports.analyzeJobFromUrl = analyzeJobFromUrl;
+exports.analyzeJobFromHtml = analyzeJobFromHtml;
 const crypto_1 = require("crypto");
 const promptPack_1 = require("./promptPack");
 const LABELS = [
@@ -256,8 +257,7 @@ exports.promptBuilders = {
     buildRankResumesPrompt: promptPack_1.buildRankResumesPrompt,
     buildAutofillPlanPrompt: promptPack_1.buildAutofillPlanPrompt,
 };
-async function analyzeJobFromUrl(url, resumesInput) {
-    const { text, title } = await fetchJobText(url);
+async function classifyFromText(title, text, resumesInput) {
     const classified = classify(title, text);
     const ranked = classified.ranked.map((r) => ({
         id: r.label,
@@ -273,4 +273,12 @@ async function analyzeJobFromUrl(url, resumesInput) {
         title: title ?? '',
         jobText: text,
     };
+}
+async function analyzeJobFromUrl(url, resumesInput) {
+    const { text, title } = await fetchJobText(url);
+    return classifyFromText(title, text, resumesInput);
+}
+async function analyzeJobFromHtml(html, pageTitle, resumesInput) {
+    const text = normalizeText(html || '');
+    return classifyFromText(pageTitle, text, resumesInput);
 }

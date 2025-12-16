@@ -19,7 +19,12 @@ exports.authGuard = (0, fastify_plugin_1.default)(async (instance) => {
         const routeUrl = request.routeOptions?.url;
         if (routeUrl === '/health' ||
             routeUrl === '/auth/login' ||
-            routeUrl === '/auth/signup') {
+            routeUrl === '/auth/signup' ||
+            (routeUrl && routeUrl.startsWith('/ws/browser'))) {
+            return;
+        }
+        // Also allow websocket upgrade paths detected via raw url.
+        if (request.raw?.url?.startsWith('/ws/browser')) {
             return;
         }
         const header = request.headers.authorization;

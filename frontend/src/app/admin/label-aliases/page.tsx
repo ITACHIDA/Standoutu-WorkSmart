@@ -17,6 +17,12 @@ type AliasResponse = {
   custom: LabelAlias[];
 };
 
+type TagRow = {
+  alias: string;
+  isDefault: boolean;
+  id?: string;
+};
+
 export default function LabelAliasesPage() {
   const router = useRouter();
   const { user, token, loading } = useAuth();
@@ -73,7 +79,7 @@ export default function LabelAliasesPage() {
     }
   }
 
-  const tagsForSelected = useMemo(() => {
+  const tagsForSelected: TagRow[] = useMemo(() => {
     if (!selectedKey) return [];
     const builtin = defaults[selectedKey] ?? [];
     const customTags = custom.filter((c) => c.canonicalKey === selectedKey);
@@ -276,9 +282,9 @@ export default function LabelAliasesPage() {
                         </div>
                       );
                     }
-                    const isEditing = editingId === tag.id;
+                    const isEditing = tag.id ? editingId === tag.id : false;
                     return (
-                      <div key={tag.id} className="flex flex-wrap items-center gap-3 px-4 py-3">
+                      <div key={tag.id ?? `custom-${tag.alias}`} className="flex flex-wrap items-center gap-3 px-4 py-3">
                         {isEditing ? (
                           <>
                             <input

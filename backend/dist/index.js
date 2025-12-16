@@ -19,7 +19,9 @@ const mammoth_1 = require("mammoth");
 const data_1 = require("./data");
 const auth_1 = require("./auth");
 const db_1 = require("./db");
+const labelAliases_1 = require("./labelAliases");
 const resumeClassifier_1 = require("./resumeClassifier");
+const msGraph_1 = require("./msGraph");
 const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
 const app = (0, fastify_1.default)({ logger: true });
 const PROJECT_ROOT = path_1.default.join(__dirname, '..');
@@ -27,6 +29,119 @@ const RESUME_DIR = process.env.RESUME_DIR ?? path_1.default.join(PROJECT_ROOT, '
 const HF_TOKEN = process.env.HF_TOKEN || process.env.HUGGINGFACEHUB_API_TOKEN || process.env.HUGGING_FACE_TOKEN || '';
 const HF_MODEL = process.env.HF_MODEL || 'meta-llama/Meta-Llama-3-8B-Instruct';
 const livePages = new Map();
+function trimString(val) {
+    if (typeof val === 'string')
+        return val.trim();
+    if (typeof val === 'number')
+        return String(val);
+    return '';
+}
+function formatPhone(contact) {
+    if (!contact)
+        return '';
+    const parts = [contact.phoneCode, contact.phoneNumber].map(trimString).filter(Boolean);
+    const combined = parts.join(' ').trim();
+    const fallback = trimString(contact.phone);
+    return combined || fallback;
+}
+function mergeBaseInfo(existing, incoming) {
+    const current = existing ?? {};
+    const next = incoming ?? {};
+    const merged = {
+        ...current,
+        ...next,
+        name: { ...(current.name ?? {}), ...(next.name ?? {}) },
+        contact: { ...(current.contact ?? {}), ...(next.contact ?? {}) },
+        location: { ...(current.location ?? {}), ...(next.location ?? {}) },
+        workAuth: { ...(current.workAuth ?? {}), ...(next.workAuth ?? {}) },
+        links: { ...(current.links ?? {}), ...(next.links ?? {}) },
+        career: { ...(current.career ?? {}), ...(next.career ?? {}) },
+        education: { ...(current.education ?? {}), ...(next.education ?? {}) },
+        preferences: { ...(current.preferences ?? {}), ...(next.preferences ?? {}) },
+        defaultAnswers: { ...(current.defaultAnswers ?? {}), ...(next.defaultAnswers ?? {}) },
+    };
+    const phone = formatPhone(merged.contact);
+    if (phone) {
+        merged.contact = { ...(merged.contact ?? {}), phone };
+    }
+    return merged;
+}
+function parseSalaryNumber(input) {
+    if (typeof input === 'number' && Number.isFinite(input))
+        return input;
+    if (typeof input !== 'string')
+        return undefined;
+    const cleaned = input.replace(/[, ]+/g, '').replace(/[^0-9.]/g, '');
+    if (!cleaned)
+        return undefined;
+    const parsed = Number(cleaned);
+    return Number.isFinite(parsed) ? parsed : undefined;
+}
+function computeHourlyRate(desiredSalary) {
+    const annual = parseSalaryNumber(desiredSalary);
+    if (!annual || annual <= 0)
+        return undefined;
+    return Math.floor(annual / 12 / 160);
+}
+function buildAutofillValueMap(baseInfo, jobContext, parsedResume) {
+    const firstName = trimString(baseInfo?.name?.first);
+    const lastName = trimString(baseInfo?.name?.last);
+    const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+    const email = trimString(baseInfo?.contact?.email);
+    const phoneCode = trimString(baseInfo?.contact?.phoneCode);
+    const phoneNumber = trimString(baseInfo?.contact?.phoneNumber);
+    const formattedPhone = phoneCode && phoneNumber ? `${phoneCode} ${phoneNumber}`.trim() : formatPhone(baseInfo?.contact);
+    const address = trimString(baseInfo?.location?.address);
+    const city = trimString(baseInfo?.location?.city);
+    const state = trimString(baseInfo?.location?.state);
+    const country = trimString(baseInfo?.location?.country);
+    const postalCode = trimString(baseInfo?.location?.postalCode);
+    const linkedin = trimString(baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin);
+    const jobTitle = trimString(baseInfo?.career?.jobTitle) || trimString(jobContext?.job_title);
+    const currentCompany = trimString(baseInfo?.career?.currentCompany) || trimString(jobContext?.company) || trimString(jobContext?.employer);
+    const yearsExp = trimString(baseInfo?.career?.yearsExp ?? parsedResume?.years_experience_general);
+    const desiredSalary = trimString(baseInfo?.career?.desiredSalary);
+    const hourlyRate = computeHourlyRate(desiredSalary);
+    const school = trimString(baseInfo?.education?.school);
+    const degree = trimString(baseInfo?.education?.degree);
+    const majorField = trimString(baseInfo?.education?.majorField);
+    const graduationDate = trimString(baseInfo?.education?.graduationAt);
+    const currentLocation = [city, state, country].filter(Boolean).join(', ');
+    const phoneCountryCode = phoneCode || (formattedPhone.startsWith('+') ? formattedPhone.split(/\s+/)[0] : trimString(baseInfo?.contact?.phone));
+    const values = {
+        full_name: fullName,
+        first_name: firstName,
+        last_name: lastName,
+        preferred_name: firstName || fullName,
+        pronouns: 'Mr',
+        email,
+        phone: formattedPhone,
+        phone_country_code: phoneCountryCode,
+        address_line1: address,
+        city,
+        state_province_region: state,
+        postal_code: postalCode,
+        country,
+        current_location: currentLocation,
+        linkedin_url: linkedin,
+        job_title: jobTitle,
+        current_company: currentCompany,
+        years_experience: yearsExp,
+        desired_salary: desiredSalary,
+        hourly_rate: hourlyRate !== undefined ? String(hourlyRate) : '',
+        start_date: 'immediately',
+        notice_period: '0',
+        school,
+        degree,
+        major_field: majorField,
+        graduation_date: graduationDate,
+        eeo_gender: 'man',
+        eeo_race_ethnicity: 'white',
+        eeo_veteran: 'no veteran',
+        eeo_disability: 'no disability',
+    };
+    return values;
+}
 function sanitizeText(input) {
     if (!input)
         return '';
@@ -237,8 +352,8 @@ function simpleParseResume(resumeText) {
         skills,
     };
 }
-async function collectPageFieldsFromFrame(frame) {
-    return frame.evaluate(() => {
+async function collectPageFieldsFromFrame(frame, meta) {
+    return frame.evaluate((frameInfo) => {
         const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
         const textOf = (el) => norm(el?.textContent || el?.innerText || '');
         const isVisible = (el) => {
@@ -400,7 +515,7 @@ async function collectPageFieldsFromFrame(frame) {
             return locators;
         };
         const slug = (v) => norm(v).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-        const controls = Array.from(document.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]')).slice(0, 150);
+        const controls = Array.from(document.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]')).slice(0, 80);
         const fields = [];
         controls.forEach((el, idx) => {
             const tag = el.tagName.toLowerCase();
@@ -430,7 +545,7 @@ async function collectPageFieldsFromFrame(frame) {
                             : tag;
             const promptCandidates = [];
             if (label)
-                promptCandidates.push({ source: 'label', text: label, score: scorePrompt(label, 'label') });
+                promptCandidates.push({ source: 'label', text: label, score: scorePrompt(label, 'label') + 8 });
             if (ariaName)
                 promptCandidates.push({ source: 'aria', text: ariaName, score: scorePrompt(ariaName, 'aria') });
             if (placeholder) {
@@ -451,9 +566,9 @@ async function collectPageFieldsFromFrame(frame) {
             nearbyPrompts.forEach((p) => {
                 promptCandidates.push({ ...p, score: scorePrompt(p.text, p.source) });
             });
-            const best = promptCandidates
-                .filter((p) => p.text)
-                .sort((a, b) => b.score - a.score)[0];
+            const best = label && promptCandidates.find((p) => p.source === 'label')
+                ? promptCandidates.find((p) => p.source === 'label')
+                : promptCandidates.filter((p) => p.text).sort((a, b) => b.score - a.score)[0];
             const questionText = best?.text || '';
             const locators = recommendedLocators(el, label || ariaName || questionText || placeholder);
             const constraints = {};
@@ -499,16 +614,21 @@ async function collectPageFieldsFromFrame(frame) {
                 selector: locators.css,
                 likelyEssay,
                 containerPrompts: nearbyPrompts,
+                frameUrl: frameInfo.frameUrl,
+                frameName: frameInfo.frameName,
             });
         });
         return fields;
-    });
+    }, { frameUrl: meta.frameUrl, frameName: meta.frameName });
 }
 async function collectPageFields(page) {
     const frames = page.frames();
-    const results = await Promise.all(frames.map(async (frame) => {
+    const results = await Promise.all(frames.map(async (frame, idx) => {
         try {
-            return await collectPageFieldsFromFrame(frame);
+            return await collectPageFieldsFromFrame(frame, {
+                frameUrl: frame.url(),
+                frameName: frame.name() || `frame-${idx}`,
+            });
         }
         catch (err) {
             console.error('collectPageFields frame failed', err);
@@ -520,7 +640,10 @@ async function collectPageFields(page) {
         return merged.slice(0, 300);
     // fallback to main frame attempt
     try {
-        return await collectPageFieldsFromFrame(page.mainFrame());
+        return await collectPageFieldsFromFrame(page.mainFrame(), {
+            frameUrl: page.mainFrame().url(),
+            frameName: page.mainFrame().name() || 'main',
+        });
     }
     catch {
         return [];
@@ -573,27 +696,182 @@ async function applyFillPlan(page, plan) {
     }
     return { filled, suggestions, blocked };
 }
+function collectLabelCandidates(field) {
+    const candidates = [];
+    const primaryPrompt = Array.isArray(field?.questionCandidates) && field.questionCandidates.length > 0
+        ? field.questionCandidates[0].text
+        : undefined;
+    [primaryPrompt, field?.questionText, field?.label, field?.ariaName, field?.placeholder, field?.describedBy, field?.field_id, field?.name, field?.id]
+        .forEach((t) => {
+        if (typeof t === 'string' && t.trim())
+            candidates.push(t);
+    });
+    if (Array.isArray(field?.containerPrompts)) {
+        field.containerPrompts.forEach((p) => {
+            if (p?.text && typeof p.text === 'string' && p.text.trim())
+                candidates.push(p.text);
+        });
+    }
+    return candidates;
+}
+const SKIP_KEYS = new Set(['cover_letter']);
+async function fillFieldsWithAliases(page, fields, aliasIndex, valueMap) {
+    const filled = [];
+    const suggestions = [];
+    const blocked = [];
+    const seen = new Set();
+    for (const field of fields ?? []) {
+        const candidates = collectLabelCandidates(field);
+        let matchedKey;
+        let matchedLabel = '';
+        for (const c of candidates) {
+            const match = (0, labelAliases_1.matchLabelToCanonical)(c, aliasIndex);
+            if (match) {
+                matchedKey = match;
+                matchedLabel = c;
+                break;
+            }
+        }
+        if (!matchedKey)
+            continue;
+        if (SKIP_KEYS.has(matchedKey))
+            continue;
+        const value = trimString(valueMap[matchedKey]);
+        const fieldName = trimString(field?.field_id || field?.name || field?.id || matchedLabel || matchedKey) || matchedKey;
+        if (seen.has(fieldName))
+            continue;
+        seen.add(fieldName);
+        if (!value) {
+            suggestions.push({ field: fieldName, suggestion: `No data available for ${matchedKey}` });
+            continue;
+        }
+        const selector = field?.selector || field?.locators?.css;
+        const labelText = matchedLabel || field?.label || field?.questionText || field?.ariaName || fieldName;
+        const tryFrames = page
+            ? (() => {
+                const main = page.mainFrame();
+                const frames = page.frames().filter((f) => f !== main);
+                return [main, ...frames];
+            })()
+            : [];
+        const tryFill = async () => {
+            if (!page || !selector)
+                return false;
+            for (const targetFrame of tryFrames) {
+                try {
+                    const trySelectByLabel = async () => targetFrame.selectOption(selector, { label: value });
+                    const trySelectByValue = async () => targetFrame.selectOption(selector, { value });
+                    const trySelectByGetByLabel = async () => {
+                        const lbl = labelText?.trim();
+                        if (!lbl)
+                            throw new Error('no label for select');
+                        await targetFrame.getByLabel(lbl, { exact: false }).selectOption({ label: value }).catch(async () => {
+                            await targetFrame.getByLabel(lbl, { exact: false }).selectOption({ value });
+                        });
+                    };
+                    const tryFillByLabel = async () => {
+                        const lbl = labelText?.trim();
+                        if (!lbl)
+                            throw new Error('no label for fill');
+                        await targetFrame.getByLabel(lbl, { exact: false }).fill(value);
+                    };
+                    if (field?.type === 'select') {
+                        const opt = await targetFrame.$(selector);
+                        if (opt) {
+                            await trySelectByLabel()
+                                .catch(trySelectByValue)
+                                .catch(async () => {
+                                await targetFrame.selectOption(selector, { label: value }).catch(async () => {
+                                    await targetFrame.selectOption(selector, { value }).catch(async () => {
+                                        await opt.focus();
+                                        await targetFrame.keyboard.type(value);
+                                    });
+                                });
+                            })
+                                .catch(() => trySelectByGetByLabel().catch(() => { }));
+                        }
+                        else {
+                            await trySelectByGetByLabel();
+                        }
+                    }
+                    else {
+                        await targetFrame.fill(selector, value).catch(async () => {
+                            await tryFillByLabel();
+                        });
+                    }
+                    return true;
+                }
+                catch {
+                    continue;
+                }
+            }
+            return false;
+        };
+        const success = await tryFill();
+        if (success) {
+            filled.push({ field: fieldName, value, confidence: 0.9 });
+        }
+        else if (!page) {
+            filled.push({ field: fieldName, value, confidence: 0.75 });
+        }
+        else {
+            blocked.push(fieldName);
+        }
+    }
+    return { filled, suggestions, blocked };
+}
+function shouldSkipPlanField(field, aliasIndex) {
+    const candidates = [field?.field_id, field?.label, field?.selector].filter((c) => typeof c === 'string' && c.trim());
+    for (const c of candidates) {
+        const match = (0, labelAliases_1.matchLabelToCanonical)(String(c), aliasIndex);
+        if (match && SKIP_KEYS.has(match))
+            return true;
+    }
+    return false;
+}
 async function simplePageFill(page, baseInfo, parsedResume) {
     const fullName = [baseInfo?.name?.first, baseInfo?.name?.last].filter(Boolean).join(' ').trim();
-    const email = baseInfo?.contact?.email;
-    const phone = baseInfo?.contact?.phone;
-    const city = baseInfo?.location?.city;
-    const country = baseInfo?.location?.country;
-    const linkedin = baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin;
-    const company = parsedResume?.experience?.[0]?.company;
-    const title = parsedResume?.experience?.[0]?.title;
+    const email = trimString(baseInfo?.contact?.email);
+    const phoneCode = trimString(baseInfo?.contact?.phoneCode);
+    const phoneNumber = trimString(baseInfo?.contact?.phoneNumber);
+    const phone = formatPhone(baseInfo?.contact);
+    const address = trimString(baseInfo?.location?.address);
+    const city = trimString(baseInfo?.location?.city);
+    const state = trimString(baseInfo?.location?.state);
+    const country = trimString(baseInfo?.location?.country);
+    const postalCode = trimString(baseInfo?.location?.postalCode);
+    const linkedin = trimString(baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin);
+    const company = trimString(baseInfo?.career?.currentCompany || parsedResume?.experience?.[0]?.company || parsedResume?.experience?.[0]?.employer);
+    const title = trimString(baseInfo?.career?.jobTitle || parsedResume?.experience?.[0]?.title);
+    const yearsExp = trimString(baseInfo?.career?.yearsExp ?? parsedResume?.years_experience_general);
+    const desiredSalary = trimString(baseInfo?.career?.desiredSalary);
+    const school = trimString(baseInfo?.education?.school);
+    const degree = trimString(baseInfo?.education?.degree);
+    const majorField = trimString(baseInfo?.education?.majorField);
+    const graduationAt = trimString(baseInfo?.education?.graduationAt);
     const filled = [];
     const targets = [
         { key: 'full_name', match: /full\s*name/i, value: fullName },
         { key: 'first', match: /first/i, value: baseInfo?.name?.first },
         { key: 'last', match: /last/i, value: baseInfo?.name?.last },
         { key: 'email', match: /email/i, value: email },
+        { key: 'phone_code', match: /(phone|mobile).*(code)|country\s*code|dial\s*code/i, value: phoneCode },
+        { key: 'phone_number', match: /(phone|mobile).*(number|no\.)/i, value: phoneNumber },
         { key: 'phone', match: /phone|tel/i, value: phone },
+        { key: 'address', match: /address/i, value: address },
         { key: 'city', match: /city/i, value: city },
+        { key: 'state', match: /state|province|region/i, value: state },
         { key: 'country', match: /country|nation/i, value: country },
+        { key: 'postal_code', match: /postal|zip/i, value: postalCode },
         { key: 'company', match: /company|employer/i, value: company },
         { key: 'title', match: /title|position|role/i, value: title },
+        { key: 'years_experience', match: /years?.*experience|experience.*years|yrs/i, value: yearsExp },
+        { key: 'desired_salary', match: /salary|compensation|pay|rate/i, value: desiredSalary },
         { key: 'linkedin', match: /linkedin|linked\s*in/i, value: linkedin },
+        { key: 'school', match: /school|university|college/i, value: school },
+        { key: 'degree', match: /degree|diploma/i, value: degree },
+        { key: 'major_field', match: /major|field\s*of\s*study/i, value: majorField },
+        { key: 'graduation_at', match: /grad/i, value: graduationAt },
     ].filter((t) => t.value);
     const inputs = await page.$$('input, textarea, select');
     for (const el of inputs) {
@@ -644,17 +922,24 @@ const DEFAULT_AUTOFILL_FIELDS = [
     { field_id: 'first_name', label: 'First name', type: 'text', required: true },
     { field_id: 'last_name', label: 'Last name', type: 'text', required: true },
     { field_id: 'email', label: 'Email', type: 'text', required: true },
+    { field_id: 'phone_code', label: 'Phone code', type: 'text', required: false },
+    { field_id: 'phone_number', label: 'Phone number', type: 'text', required: false },
     { field_id: 'phone', label: 'Phone', type: 'text', required: false },
+    { field_id: 'address', label: 'Address', type: 'text', required: false },
     { field_id: 'city', label: 'City', type: 'text', required: false },
+    { field_id: 'state', label: 'State/Province', type: 'text', required: false },
     { field_id: 'country', label: 'Country', type: 'text', required: false },
+    { field_id: 'postal_code', label: 'Postal code', type: 'text', required: false },
+    { field_id: 'linkedin', label: 'LinkedIn', type: 'text', required: false },
+    { field_id: 'job_title', label: 'Job title', type: 'text', required: false },
+    { field_id: 'current_company', label: 'Current company', type: 'text', required: false },
+    { field_id: 'years_exp', label: 'Years of experience', type: 'number', required: false },
+    { field_id: 'desired_salary', label: 'Desired salary', type: 'text', required: false },
+    { field_id: 'school', label: 'School', type: 'text', required: false },
+    { field_id: 'degree', label: 'Degree', type: 'text', required: false },
+    { field_id: 'major_field', label: 'Major/Field', type: 'text', required: false },
+    { field_id: 'graduation_at', label: 'Graduation date', type: 'text', required: false },
     { field_id: 'work_auth', label: 'Authorized to work?', type: 'checkbox', required: false },
-    {
-        field_id: 'cover_letter',
-        label: 'Why are you a fit?',
-        type: 'textarea',
-        required: false,
-        surrounding_text: 'brief pitch/cover letter, keep to 2-3 sentences',
-    },
 ];
 // initDb, auth guard, signToken live in dedicated modules
 async function bootstrap() {
@@ -732,7 +1017,7 @@ async function bootstrap() {
         if (actor.role === 'ADMIN' || actor.role === 'MANAGER') {
             if (userId) {
                 const target = await (0, db_1.findUserById)(userId);
-                if ((target === null || target === void 0 ? void 0 : target.role) === 'BIDDER' && target.isActive !== false) {
+                if (target?.role === 'BIDDER' && target.isActive !== false) {
                     return (0, db_1.listProfilesForBidder)(target.id);
                 }
             }
@@ -752,17 +1037,68 @@ async function bootstrap() {
         }
         const schema = zod_1.z.object({
             displayName: zod_1.z.string().min(2),
+            baseInfo: zod_1.z.record(zod_1.z.any()).optional(),
             firstName: zod_1.z.string().optional(),
             lastName: zod_1.z.string().optional(),
             email: zod_1.z.string().email().optional(),
+            phoneCode: zod_1.z.string().optional(),
+            phoneNumber: zod_1.z.string().optional(),
+            address: zod_1.z.string().optional(),
+            city: zod_1.z.string().optional(),
+            state: zod_1.z.string().optional(),
+            country: zod_1.z.string().optional(),
+            postalCode: zod_1.z.string().optional(),
+            linkedin: zod_1.z.string().optional(),
+            jobTitle: zod_1.z.string().optional(),
+            currentCompany: zod_1.z.string().optional(),
+            yearsExp: zod_1.z.union([zod_1.z.string(), zod_1.z.number()]).optional(),
+            desiredSalary: zod_1.z.string().optional(),
+            school: zod_1.z.string().optional(),
+            degree: zod_1.z.string().optional(),
+            majorField: zod_1.z.string().optional(),
+            graduationAt: zod_1.z.string().optional(),
         });
         const body = schema.parse(request.body);
         const profileId = (0, crypto_1.randomUUID)();
         const now = new Date().toISOString();
-        const baseInfo = {
-            name: { first: body.firstName ?? '', last: body.lastName ?? '' },
-            contact: { email: body.email ?? '' },
-        };
+        const incomingBase = (body.baseInfo ?? {});
+        const baseInfo = mergeBaseInfo({}, {
+            ...incomingBase,
+            name: {
+                ...(incomingBase.name ?? {}),
+                first: trimString(body.firstName ?? incomingBase.name?.first),
+                last: trimString(body.lastName ?? incomingBase.name?.last),
+            },
+            contact: {
+                ...(incomingBase.contact ?? {}),
+                email: trimString(body.email ?? incomingBase.contact?.email),
+                phoneCode: trimString(body.phoneCode ?? incomingBase.contact?.phoneCode),
+                phoneNumber: trimString(body.phoneNumber ?? incomingBase.contact?.phoneNumber),
+            },
+            location: {
+                ...(incomingBase.location ?? {}),
+                address: trimString(body.address ?? incomingBase.location?.address),
+                city: trimString(body.city ?? incomingBase.location?.city),
+                state: trimString(body.state ?? incomingBase.location?.state),
+                country: trimString(body.country ?? incomingBase.location?.country),
+                postalCode: trimString(body.postalCode ?? incomingBase.location?.postalCode),
+            },
+            links: { ...(incomingBase.links ?? {}), linkedin: trimString(body.linkedin ?? incomingBase.links?.linkedin) },
+            career: {
+                ...(incomingBase.career ?? {}),
+                jobTitle: trimString(body.jobTitle ?? incomingBase.career?.jobTitle),
+                currentCompany: trimString(body.currentCompany ?? incomingBase.career?.currentCompany),
+                yearsExp: body.yearsExp ?? incomingBase.career?.yearsExp,
+                desiredSalary: trimString(body.desiredSalary ?? incomingBase.career?.desiredSalary),
+            },
+            education: {
+                ...(incomingBase.education ?? {}),
+                school: trimString(body.school ?? incomingBase.education?.school),
+                degree: trimString(body.degree ?? incomingBase.education?.degree),
+                majorField: trimString(body.majorField ?? incomingBase.education?.majorField),
+                graduationAt: trimString(body.graduationAt ?? incomingBase.education?.graduationAt),
+            },
+        });
         const profile = {
             id: profileId,
             displayName: body.displayName,
@@ -791,19 +1127,7 @@ async function bootstrap() {
         });
         const body = schema.parse(request.body ?? {});
         const incomingBase = (body.baseInfo ?? {});
-        const mergedBase = {
-            ...(existing.baseInfo ?? {}),
-            ...(incomingBase || {}),
-            name: { ...(existing.baseInfo?.name ?? {}), ...(incomingBase?.name ?? {}) },
-            contact: { ...(existing.baseInfo?.contact ?? {}), ...(incomingBase?.contact ?? {}) },
-            location: { ...(existing.baseInfo?.location ?? {}), ...(incomingBase?.location ?? {}) },
-            workAuth: { ...(existing.baseInfo?.workAuth ?? {}), ...(incomingBase?.workAuth ?? {}) },
-            links: { ...(existing.baseInfo?.links ?? {}), ...(incomingBase?.links ?? {}) },
-            defaultAnswers: {
-                ...(existing.baseInfo?.defaultAnswers ?? {}),
-                ...(incomingBase?.defaultAnswers ?? {}),
-            },
-        };
+        const mergedBase = mergeBaseInfo(existing.baseInfo, incomingBase);
         const updatedProfile = {
             ...existing,
             displayName: body.displayName ?? existing.displayName,
@@ -917,6 +1241,114 @@ async function bootstrap() {
         }
         await (0, db_1.deleteResumeById)(resumeId);
         return { ok: true };
+    });
+    app.get('/calendar/accounts', async (request, reply) => {
+        if ((0, auth_1.forbidObserver)(reply, request.authUser))
+            return;
+        const actor = request.authUser;
+        if (!actor) {
+            return reply.status(401).send({ message: 'Unauthorized' });
+        }
+        const parsed = zod_1.z
+            .object({
+            profileId: zod_1.z.string().uuid().optional(),
+        })
+            .safeParse(request.query);
+        if (!parsed.success) {
+            return reply.status(400).send({ message: 'Invalid query' });
+        }
+        return (0, db_1.listProfileAccountsForUser)(actor, parsed.data.profileId);
+    });
+    app.post('/calendar/accounts', async (request, reply) => {
+        if ((0, auth_1.forbidObserver)(reply, request.authUser))
+            return;
+        const actor = request.authUser;
+        if (!actor) {
+            return reply.status(401).send({ message: 'Unauthorized' });
+        }
+        const schema = zod_1.z.object({
+            profileId: zod_1.z.string().uuid(),
+            email: zod_1.z.string().email(),
+            provider: zod_1.z.enum(['MICROSOFT', 'GOOGLE']).default('MICROSOFT').optional(),
+            displayName: zod_1.z.string().min(1).optional(),
+            timezone: zod_1.z.string().min(2).optional(),
+        });
+        const body = schema.parse(request.body ?? {});
+        const profile = await (0, db_1.findProfileById)(body.profileId);
+        if (!profile) {
+            return reply.status(404).send({ message: 'Profile not found' });
+        }
+        const isManager = actor.role === 'ADMIN' || actor.role === 'MANAGER';
+        const isAssignedBidder = profile.assignedBidderId === actor.id;
+        if (!isManager && !isAssignedBidder) {
+            return reply.status(403).send({ message: 'Not allowed to manage accounts for this profile' });
+        }
+        const account = await (0, db_1.upsertProfileAccount)({
+            id: (0, crypto_1.randomUUID)(),
+            profileId: body.profileId,
+            provider: body.provider ?? 'MICROSOFT',
+            email: body.email.toLowerCase(),
+            displayName: body.displayName ?? body.email,
+            timezone: body.timezone ?? 'UTC',
+            status: 'ACTIVE',
+        });
+        return account;
+    });
+    app.get('/calendar/events', async (request, reply) => {
+        if ((0, auth_1.forbidObserver)(reply, request.authUser))
+            return;
+        const actor = request.authUser;
+        if (!actor) {
+            return reply.status(401).send({ message: 'Unauthorized' });
+        }
+        const parsed = zod_1.z
+            .object({
+            accountId: zod_1.z.string().uuid(),
+            start: zod_1.z.string(),
+            end: zod_1.z.string(),
+        })
+            .safeParse(request.query);
+        if (!parsed.success) {
+            return reply.status(400).send({ message: 'Invalid query' });
+        }
+        const { accountId, start, end } = parsed.data;
+        const account = await (0, db_1.findProfileAccountById)(accountId);
+        if (!account) {
+            return reply.status(404).send({ message: 'Calendar account not found' });
+        }
+        const isManager = actor.role === 'ADMIN' || actor.role === 'MANAGER';
+        const isAssignedBidder = account.profileAssignedBidderId === actor.id;
+        if (!isManager && !isAssignedBidder) {
+            return reply.status(403).send({ message: 'Not allowed to view this calendar' });
+        }
+        const startDate = new Date(start);
+        const endDate = new Date(end);
+        if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
+            return reply.status(400).send({ message: 'Invalid date range' });
+        }
+        if (endDate <= startDate) {
+            return reply.status(400).send({ message: 'End must be after start' });
+        }
+        const { events: calendarEvents, source, warning } = await (0, msGraph_1.loadOutlookEvents)({
+            email: account.email,
+            rangeStart: start,
+            rangeEnd: end,
+            timezone: account.timezone,
+            logger: request.log,
+        });
+        await (0, db_1.touchProfileAccount)(account.id, new Date().toISOString());
+        return {
+            account: {
+                id: account.id,
+                email: account.email,
+                profileId: account.profileId,
+                profileDisplayName: account.profileDisplayName,
+                timezone: account.timezone,
+            },
+            events: calendarEvents,
+            source,
+            warning,
+        };
     });
     app.get('/resumes/:id/file', async (request, reply) => {
         if ((0, auth_1.forbidObserver)(reply, request.authUser))
@@ -1092,7 +1524,24 @@ async function bootstrap() {
             return reply.status(404).send({ message: 'Session not found' });
         const body = request.body ?? {};
         const useAi = Boolean(body.useAi);
-        const analysis = await (0, resumeClassifier_1.analyzeJobFromUrl)(session.url);
+        const live = livePages.get(id);
+        const page = live?.page;
+        if (!page) {
+            return reply.status(400).send({ message: 'Live page not available. Click Go and load the page before Analyze.' });
+        }
+        let pageHtml = '';
+        let pageTitle = '';
+        try {
+            pageTitle = await page.title();
+            pageHtml = await page.content();
+        }
+        catch (err) {
+            request.log.error({ err }, 'failed to read live page content');
+        }
+        if (!pageHtml) {
+            return reply.status(400).send({ message: 'No page content captured. Load the page before Analyze.' });
+        }
+        const analysis = await (0, resumeClassifier_1.analyzeJobFromHtml)(pageHtml, pageTitle);
         session.status = 'ANALYZED';
         session.jobContext = {
             title: analysis.title || 'Job',
@@ -1209,6 +1658,102 @@ async function bootstrap() {
             return reply.status(502).send({ message: 'LLM autofill failed' });
         return parsed;
     });
+    app.get('/label-aliases', async (request, reply) => {
+        if ((0, auth_1.forbidObserver)(reply, request.authUser))
+            return;
+        const actor = request.authUser;
+        if (!actor || actor.role !== 'ADMIN') {
+            return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+        }
+        const custom = await (0, db_1.listLabelAliases)();
+        return { defaults: labelAliases_1.DEFAULT_LABEL_ALIASES, custom };
+    });
+    app.post('/label-aliases', async (request, reply) => {
+        if ((0, auth_1.forbidObserver)(reply, request.authUser))
+            return;
+        const actor = request.authUser;
+        if (!actor || actor.role !== 'ADMIN') {
+            return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+        }
+        const schema = zod_1.z.object({
+            canonicalKey: zod_1.z.string(),
+            alias: zod_1.z.string().min(2),
+        });
+        const body = schema.parse(request.body ?? {});
+        const canonicalKey = body.canonicalKey.trim();
+        if (!labelAliases_1.CANONICAL_LABEL_KEYS.has(canonicalKey)) {
+            return reply.status(400).send({ message: 'Unknown canonical key' });
+        }
+        const normalizedAlias = (0, labelAliases_1.normalizeLabelAlias)(body.alias);
+        if (!normalizedAlias) {
+            return reply.status(400).send({ message: 'Alias cannot be empty' });
+        }
+        const existing = await (0, db_1.findLabelAliasByNormalized)(normalizedAlias);
+        if (existing) {
+            return reply.status(409).send({ message: 'Alias already exists' });
+        }
+        const aliasRecord = {
+            id: (0, crypto_1.randomUUID)(),
+            canonicalKey,
+            alias: body.alias.trim(),
+            normalizedAlias,
+        };
+        await (0, db_1.insertLabelAlias)(aliasRecord);
+        return aliasRecord;
+    });
+    app.patch('/label-aliases/:id', async (request, reply) => {
+        if ((0, auth_1.forbidObserver)(reply, request.authUser))
+            return;
+        const actor = request.authUser;
+        if (!actor || actor.role !== 'ADMIN') {
+            return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+        }
+        const { id } = request.params;
+        const schema = zod_1.z.object({
+            canonicalKey: zod_1.z.string().optional(),
+            alias: zod_1.z.string().optional(),
+        });
+        const body = schema.parse(request.body ?? {});
+        const existing = await (0, db_1.findLabelAliasById)(id);
+        if (!existing)
+            return reply.status(404).send({ message: 'Alias not found' });
+        const canonicalKey = body.canonicalKey?.trim() || existing.canonicalKey;
+        if (!labelAliases_1.CANONICAL_LABEL_KEYS.has(canonicalKey)) {
+            return reply.status(400).send({ message: 'Unknown canonical key' });
+        }
+        const aliasText = (body.alias ?? existing.alias).trim();
+        const normalizedAlias = (0, labelAliases_1.normalizeLabelAlias)(aliasText);
+        if (!normalizedAlias) {
+            return reply.status(400).send({ message: 'Alias cannot be empty' });
+        }
+        const conflict = await (0, db_1.findLabelAliasByNormalized)(normalizedAlias);
+        if (conflict && conflict.id !== id) {
+            return reply.status(409).send({ message: 'Alias already exists' });
+        }
+        const updated = {
+            ...existing,
+            canonicalKey,
+            alias: aliasText,
+            normalizedAlias,
+            updatedAt: new Date().toISOString(),
+        };
+        await (0, db_1.updateLabelAliasRecord)(updated);
+        return updated;
+    });
+    app.delete('/label-aliases/:id', async (request, reply) => {
+        if ((0, auth_1.forbidObserver)(reply, request.authUser))
+            return;
+        const actor = request.authUser;
+        if (!actor || actor.role !== 'ADMIN') {
+            return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+        }
+        const { id } = request.params;
+        const existing = await (0, db_1.findLabelAliasById)(id);
+        if (!existing)
+            return reply.status(404).send({ message: 'Alias not found' });
+        await (0, db_1.deleteLabelAlias)(id);
+        return { status: 'deleted', id };
+    });
     app.post('/sessions/:id/autofill', async (request, reply) => {
         if ((0, auth_1.forbidObserver)(reply, request.authUser))
             return;
@@ -1238,33 +1783,26 @@ async function bootstrap() {
                 request.log.error({ err }, 'collectPageFields failed');
             }
         }
-        // Fallback: if no live page or nothing detected, spin up a fresh headless page to capture fields.
-        if ((!page || pageFields.length === 0) && session.url) {
-            try {
-                const browser = await playwright_1.chromium.launch({ headless: true });
-                const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-                const tmpPage = await context.newPage();
-                await tmpPage.goto(session.url, { waitUntil: 'domcontentloaded', timeout: 20000 });
-                // small settle time for dynamic renderers
-                await tmpPage.waitForTimeout(800);
-                await tmpPage
-                    .waitForSelector('input, textarea, select, [contenteditable="true"], [role="textbox"]', { timeout: 5000 })
-                    .catch(() => { });
-                pageFields = await collectPageFields(tmpPage);
-                await browser.close();
-            }
-            catch (err) {
-                request.log.error({ err }, 'collectPageFields headless fallback failed');
-            }
-        }
-        let candidateFields = Array.isArray(body.pageFields) && body.pageFields.length > 0
+        const candidateFields = Array.isArray(body.pageFields) && body.pageFields.length > 0
             ? body.pageFields
             : pageFields.length
                 ? pageFields
                 : DEFAULT_AUTOFILL_FIELDS;
-        let fillPlan = buildDemoFillPlan(profile.baseInfo);
+        const autofillValues = buildAutofillValueMap(profile.baseInfo ?? {}, session.jobContext ?? {}, hydratedResume?.parsedResume);
+        const aliasIndex = (0, labelAliases_1.buildAliasIndex)(await (0, db_1.listLabelAliases)());
+        const useLlm = body.useLlm !== false;
+        let fillPlan = { filled: [], suggestions: [], blocked: [] };
+        if (candidateFields.length > 0) {
+            try {
+                fillPlan = await fillFieldsWithAliases(page, candidateFields, aliasIndex, autofillValues);
+            }
+            catch (err) {
+                request.log.error({ err }, 'label-db autofill failed');
+                fillPlan = { filled: [], suggestions: [], blocked: [] };
+            }
+        }
         try {
-            if (hydratedResume?.resumeText) {
+            if (useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && hydratedResume?.resumeText && candidateFields.length > 0) {
                 const prompt = resumeClassifier_1.promptBuilders.buildAutofillPlanPrompt({
                     pageFields: candidateFields,
                     baseProfile: profile.baseInfo ?? {},
@@ -1281,8 +1819,9 @@ async function bootstrap() {
                 const parsed = await (0, resumeClassifier_1.callPromptPack)(prompt);
                 const llmPlan = parsed?.result?.fill_plan;
                 if (Array.isArray(llmPlan)) {
-                    const applied = page ? await applyFillPlan(page, llmPlan) : { filled: [], blocked: [], suggestions: [] };
-                    const filledFromPlan = llmPlan
+                    const filteredPlan = llmPlan.filter((f) => !shouldSkipPlanField(f, aliasIndex));
+                    const applied = page ? await applyFillPlan(page, filteredPlan) : { filled: [], blocked: [], suggestions: [] };
+                    const filledFromPlan = filteredPlan
                         .filter((f) => (f.action === 'fill' || f.action === 'select') && f.value)
                         .map((f) => ({
                         field: f.field_id ?? f.selector ?? f.label ?? 'field',
@@ -1314,14 +1853,17 @@ async function bootstrap() {
         }
         catch (err) {
             request.log.error({ err }, 'LLM autofill failed, using demo plan');
-            if (page) {
-                try {
-                    fillPlan = await simplePageFill(page, profile.baseInfo, hydratedResume?.parsedResume);
-                }
-                catch (e) {
-                    request.log.error({ err: e }, 'simplePageFill failed');
-                }
+        }
+        if (!useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && page && candidateFields.length > 0) {
+            try {
+                fillPlan = await simplePageFill(page, profile.baseInfo, hydratedResume?.parsedResume);
             }
+            catch (e) {
+                request.log.error({ err: e }, 'simplePageFill failed');
+            }
+        }
+        if (!fillPlan.filled?.length && !fillPlan.suggestions?.length && !fillPlan.blocked?.length) {
+            fillPlan = buildDemoFillPlan(profile.baseInfo);
         }
         session.status = 'FILLED';
         session.selectedResumeId = resumeId ?? session.selectedResumeId;
@@ -1454,21 +1996,24 @@ async function bootstrap() {
     });
     app.get('/ws/browser/:sessionId', { websocket: true }, async (connection, req) => {
         // Allow ws without auth for now to keep demo functional
+        if (!connection || !connection.socket) {
+            return;
+        }
         const { sessionId } = req.params;
         const live = livePages.get(sessionId);
         if (!live) {
-            connection.socket.send(JSON.stringify({ type: 'error', message: 'No live browser' }));
-            connection.socket.close();
+            connection.socket?.send(JSON.stringify({ type: 'error', message: 'No live browser' }));
+            connection.socket?.close();
             return;
         }
         const { page } = live;
         const sendFrame = async () => {
             try {
                 const buf = await page.screenshot({ fullPage: true });
-                connection.socket.send(JSON.stringify({ type: 'frame', data: buf.toString('base64') }));
+                connection.socket?.send(JSON.stringify({ type: 'frame', data: buf.toString('base64') }));
             }
             catch (err) {
-                connection.socket.send(JSON.stringify({ type: 'error', message: 'Could not capture frame' }));
+                connection.socket?.send(JSON.stringify({ type: 'error', message: 'Could not capture frame' }));
             }
         };
         // Send frames every second
@@ -1493,18 +2038,35 @@ function tryExtractDomain(url) {
     }
 }
 function buildDemoFillPlan(baseInfo) {
+    const phone = formatPhone(baseInfo?.contact);
     const safeFields = [
         { field: 'first_name', value: baseInfo?.name?.first, confidence: 0.98 },
         { field: 'last_name', value: baseInfo?.name?.last, confidence: 0.98 },
         { field: 'email', value: baseInfo?.contact?.email, confidence: 0.97 },
-        { field: 'phone', value: baseInfo?.contact?.phone, confidence: 0.8 },
+        { field: 'phone_code', value: baseInfo?.contact?.phoneCode, confidence: 0.75 },
+        { field: 'phone_number', value: baseInfo?.contact?.phoneNumber, confidence: 0.78 },
+        { field: 'phone', value: phone, confidence: 0.8 },
+        { field: 'address', value: baseInfo?.location?.address, confidence: 0.75 },
+        { field: 'city', value: baseInfo?.location?.city, confidence: 0.75 },
+        { field: 'state', value: baseInfo?.location?.state, confidence: 0.72 },
+        { field: 'country', value: baseInfo?.location?.country, confidence: 0.72 },
+        { field: 'postal_code', value: baseInfo?.location?.postalCode, confidence: 0.72 },
+        { field: 'linkedin', value: baseInfo?.links?.linkedin, confidence: 0.78 },
+        { field: 'job_title', value: baseInfo?.career?.jobTitle, confidence: 0.7 },
+        { field: 'current_company', value: baseInfo?.career?.currentCompany, confidence: 0.68 },
+        { field: 'years_exp', value: baseInfo?.career?.yearsExp, confidence: 0.6 },
+        { field: 'desired_salary', value: baseInfo?.career?.desiredSalary, confidence: 0.62 },
+        { field: 'school', value: baseInfo?.education?.school, confidence: 0.66 },
+        { field: 'degree', value: baseInfo?.education?.degree, confidence: 0.65 },
+        { field: 'major_field', value: baseInfo?.education?.majorField, confidence: 0.64 },
+        { field: 'graduation_at', value: baseInfo?.education?.graduationAt, confidence: 0.6 },
     ];
     const filled = safeFields
         .filter((f) => Boolean(f.value))
         .map((f) => ({ field: f.field, value: String(f.value ?? ''), confidence: f.confidence }));
     return {
         filled,
-        suggestions: [{ field: 'cover_letter', suggestion: 'Short note about relevant skills' }],
+        suggestions: [],
         blocked: ['EEO', 'veteran_status', 'disability'],
     };
 }

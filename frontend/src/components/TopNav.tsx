@@ -53,6 +53,7 @@ export default function TopNav() {
         <nav className="flex items-center gap-2">
           <NavItem href="/" label="Home" active={pathname === '/'} />
           <NavItem href="/workspace" label="Workspace" active={pathname.startsWith('/workspace')} />
+          <NavItem href="/calendar" label="Calendar" active={pathname.startsWith('/calendar')} />
           <NavItem href="/about" label="About" active={pathname.startsWith('/about')} />
           <NavItem href="/career" label="Career" active={pathname.startsWith('/career')} />
           {isManager && (

@@ -9,6 +9,10 @@ exports.insertProfile = insertProfile;
 exports.listProfiles = listProfiles;
 exports.listProfilesForBidder = listProfilesForBidder;
 exports.findProfileById = findProfileById;
+exports.listProfileAccountsForUser = listProfileAccountsForUser;
+exports.findProfileAccountById = findProfileAccountById;
+exports.upsertProfileAccount = upsertProfileAccount;
+exports.touchProfileAccount = touchProfileAccount;
 exports.updateProfileRecord = updateProfileRecord;
 exports.insertResumeRecord = insertResumeRecord;
 exports.deleteResumeById = deleteResumeById;
@@ -19,6 +23,12 @@ exports.findActiveAssignmentByProfile = findActiveAssignmentByProfile;
 exports.insertAssignmentRecord = insertAssignmentRecord;
 exports.closeAssignmentById = closeAssignmentById;
 exports.listBidderSummaries = listBidderSummaries;
+exports.listLabelAliases = listLabelAliases;
+exports.findLabelAliasById = findLabelAliasById;
+exports.findLabelAliasByNormalized = findLabelAliasByNormalized;
+exports.insertLabelAlias = insertLabelAlias;
+exports.updateLabelAliasRecord = updateLabelAliasRecord;
+exports.deleteLabelAlias = deleteLabelAlias;
 const pg_1 = require("pg");
 exports.pool = new pg_1.Pool({
     connectionString: process.env.DATABASE_URL,
@@ -94,6 +104,31 @@ async function initDb() {
         embed_model TEXT,
         updated_at TIMESTAMP DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS label_aliases (
+        id UUID PRIMARY KEY,
+        canonical_key TEXT NOT NULL,
+        alias TEXT NOT NULL,
+        normalized_alias TEXT NOT NULL UNIQUE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW()
+      );
+
+      CREATE TABLE IF NOT EXISTS profile_accounts (
+        id UUID PRIMARY KEY,
+        profile_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL DEFAULT 'MICROSOFT',
+        email TEXT NOT NULL,
+        display_name TEXT,
+        timezone TEXT DEFAULT 'UTC',
+        status TEXT DEFAULT 'ACTIVE',
+        last_sync_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (profile_id, email)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_profile_accounts_profile ON profile_accounts(profile_id);
 
       -- Backfill schema changes at startup to avoid missing migration runs.
       ALTER TABLE IF EXISTS resumes
@@ -197,6 +232,94 @@ async function findProfileById(id) {
       WHERE id = $1
     `, [id]);
     return rows[0];
+}
+async function listProfileAccountsForUser(actor, profileId) {
+    const { rows } = await exports.pool.query(`
+      SELECT
+        pa.id,
+        pa.profile_id AS "profileId",
+        pa.provider,
+        pa.email,
+        pa.display_name AS "displayName",
+        pa.timezone,
+        pa.status,
+        pa.last_sync_at AS "lastSyncAt",
+        pa.created_at AS "createdAt",
+        pa.updated_at AS "updatedAt",
+        p.display_name AS "profileDisplayName",
+        p.assigned_bidder_id AS "profileAssignedBidderId"
+      FROM profile_accounts pa
+      JOIN profiles p ON p.id = pa.profile_id
+      WHERE
+        ($1 = 'ADMIN' OR $1 = 'MANAGER' OR p.assigned_bidder_id = $2)
+        AND ($3::uuid IS NULL OR pa.profile_id = $3)
+      ORDER BY pa.updated_at DESC, pa.created_at DESC
+    `, [actor.role, actor.id, profileId ?? null]);
+    return rows;
+}
+async function findProfileAccountById(id) {
+    const { rows } = await exports.pool.query(`
+      SELECT
+        pa.id,
+        pa.profile_id AS "profileId",
+        pa.provider,
+        pa.email,
+        pa.display_name AS "displayName",
+        pa.timezone,
+        pa.status,
+        pa.last_sync_at AS "lastSyncAt",
+        pa.created_at AS "createdAt",
+        pa.updated_at AS "updatedAt",
+        p.display_name AS "profileDisplayName",
+        p.assigned_bidder_id AS "profileAssignedBidderId"
+      FROM profile_accounts pa
+      JOIN profiles p ON p.id = pa.profile_id
+      WHERE pa.id = $1
+      LIMIT 1
+    `, [id]);
+    return rows[0];
+}
+async function upsertProfileAccount(account) {
+    const { rows } = await exports.pool.query(`
+      INSERT INTO profile_accounts (id, profile_id, provider, email, display_name, timezone, status, last_sync_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (profile_id, email) DO UPDATE
+        SET provider = EXCLUDED.provider,
+            display_name = EXCLUDED.display_name,
+            timezone = EXCLUDED.timezone,
+            status = EXCLUDED.status,
+            last_sync_at = COALESCE(EXCLUDED.last_sync_at, profile_accounts.last_sync_at),
+            updated_at = NOW()
+      RETURNING
+        id,
+        profile_id AS "profileId",
+        provider,
+        email,
+        display_name AS "displayName",
+        timezone,
+        status,
+        last_sync_at AS "lastSyncAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+    `, [
+        account.id,
+        account.profileId,
+        account.provider ?? 'MICROSOFT',
+        account.email,
+        account.displayName ?? null,
+        account.timezone ?? 'UTC',
+        account.status ?? 'ACTIVE',
+        account.lastSyncAt ?? null,
+    ]);
+    return rows[0];
+}
+async function touchProfileAccount(id, lastSyncAt) {
+    await exports.pool.query(`
+      UPDATE profile_accounts
+      SET last_sync_at = $2,
+          updated_at = NOW()
+      WHERE id = $1
+    `, [id, lastSyncAt ?? new Date().toISOString()]);
 }
 async function updateProfileRecord(profile) {
     await exports.pool.query(`
@@ -315,4 +438,75 @@ async function listBidderSummaries() {
         email: r.email,
         profiles: r.profiles ?? [],
     }));
+}
+async function listLabelAliases() {
+    const { rows } = await exports.pool.query(`
+      SELECT
+        id,
+        canonical_key AS "canonicalKey",
+        alias,
+        normalized_alias AS "normalizedAlias",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM label_aliases
+      ORDER BY created_at ASC
+    `);
+    return rows;
+}
+async function findLabelAliasById(id) {
+    const { rows } = await exports.pool.query(`
+      SELECT
+        id,
+        canonical_key AS "canonicalKey",
+        alias,
+        normalized_alias AS "normalizedAlias",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM label_aliases
+      WHERE id = $1
+      LIMIT 1
+    `, [id]);
+    return rows[0];
+}
+async function findLabelAliasByNormalized(normalized) {
+    const { rows } = await exports.pool.query(`
+      SELECT
+        id,
+        canonical_key AS "canonicalKey",
+        alias,
+        normalized_alias AS "normalizedAlias",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+      FROM label_aliases
+      WHERE normalized_alias = $1
+      LIMIT 1
+    `, [normalized]);
+    return rows[0];
+}
+async function insertLabelAlias(alias) {
+    await exports.pool.query(`
+      INSERT INTO label_aliases (id, canonical_key, alias, normalized_alias, created_at, updated_at)
+      VALUES ($1, $2, $3, $4, COALESCE($5, NOW()), COALESCE($6, NOW()))
+      ON CONFLICT (normalized_alias) DO NOTHING
+    `, [
+        alias.id,
+        alias.canonicalKey,
+        alias.alias,
+        alias.normalizedAlias,
+        alias.createdAt ?? new Date().toISOString(),
+        alias.updatedAt ?? new Date().toISOString(),
+    ]);
+}
+async function updateLabelAliasRecord(alias) {
+    await exports.pool.query(`
+      UPDATE label_aliases
+      SET canonical_key = $2,
+          alias = $3,
+          normalized_alias = $4,
+          updated_at = COALESCE($5, NOW())
+      WHERE id = $1
+    `, [alias.id, alias.canonicalKey, alias.alias, alias.normalizedAlias, alias.updatedAt ?? new Date().toISOString()]);
+}
+async function deleteLabelAlias(id) {
+    await exports.pool.query('DELETE FROM label_aliases WHERE id = $1', [id]);
 }

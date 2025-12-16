@@ -1,5 +1,13 @@
 import { Pool } from 'pg';
-import { Assignment, LabelAlias, Profile, Resume, User } from './types';
+import {
+  Assignment,
+  LabelAlias,
+  Profile,
+  ProfileAccount,
+  ProfileAccountWithProfile,
+  Resume,
+  User,
+} from './types';
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -85,6 +93,22 @@ export async function initDb() {
         created_at TIMESTAMP DEFAULT NOW(),
         updated_at TIMESTAMP DEFAULT NOW()
       );
+
+      CREATE TABLE IF NOT EXISTS profile_accounts (
+        id UUID PRIMARY KEY,
+        profile_id UUID REFERENCES profiles(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL DEFAULT 'MICROSOFT',
+        email TEXT NOT NULL,
+        display_name TEXT,
+        timezone TEXT DEFAULT 'UTC',
+        status TEXT DEFAULT 'ACTIVE',
+        last_sync_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT NOW(),
+        updated_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (profile_id, email)
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_profile_accounts_profile ON profile_accounts(profile_id);
 
       -- Backfill schema changes at startup to avoid missing migration runs.
       ALTER TABLE IF EXISTS resumes
@@ -222,6 +246,122 @@ export async function findProfileById(id: string): Promise<Profile | undefined> 
     [id],
   );
   return rows[0];
+}
+
+export async function listProfileAccountsForUser(
+  actor: User,
+  profileId?: string,
+): Promise<ProfileAccountWithProfile[]> {
+  const { rows } = await pool.query<ProfileAccountWithProfile>(
+    `
+      SELECT
+        pa.id,
+        pa.profile_id AS "profileId",
+        pa.provider,
+        pa.email,
+        pa.display_name AS "displayName",
+        pa.timezone,
+        pa.status,
+        pa.last_sync_at AS "lastSyncAt",
+        pa.created_at AS "createdAt",
+        pa.updated_at AS "updatedAt",
+        p.display_name AS "profileDisplayName",
+        p.assigned_bidder_id AS "profileAssignedBidderId"
+      FROM profile_accounts pa
+      JOIN profiles p ON p.id = pa.profile_id
+      WHERE
+        ($1 = 'ADMIN' OR $1 = 'MANAGER' OR p.assigned_bidder_id = $2)
+        AND ($3::uuid IS NULL OR pa.profile_id = $3)
+      ORDER BY pa.updated_at DESC, pa.created_at DESC
+    `,
+    [actor.role, actor.id, profileId ?? null],
+  );
+  return rows;
+}
+
+export async function findProfileAccountById(id: string): Promise<ProfileAccountWithProfile | undefined> {
+  const { rows } = await pool.query<ProfileAccountWithProfile>(
+    `
+      SELECT
+        pa.id,
+        pa.profile_id AS "profileId",
+        pa.provider,
+        pa.email,
+        pa.display_name AS "displayName",
+        pa.timezone,
+        pa.status,
+        pa.last_sync_at AS "lastSyncAt",
+        pa.created_at AS "createdAt",
+        pa.updated_at AS "updatedAt",
+        p.display_name AS "profileDisplayName",
+        p.assigned_bidder_id AS "profileAssignedBidderId"
+      FROM profile_accounts pa
+      JOIN profiles p ON p.id = pa.profile_id
+      WHERE pa.id = $1
+      LIMIT 1
+    `,
+    [id],
+  );
+  return rows[0];
+}
+
+export async function upsertProfileAccount(account: {
+  id: string;
+  profileId: string;
+  provider?: string;
+  email: string;
+  displayName?: string | null;
+  timezone?: string | null;
+  status?: string | null;
+  lastSyncAt?: string | null;
+}): Promise<ProfileAccount> {
+  const { rows } = await pool.query<ProfileAccount>(
+    `
+      INSERT INTO profile_accounts (id, profile_id, provider, email, display_name, timezone, status, last_sync_at)
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (profile_id, email) DO UPDATE
+        SET provider = EXCLUDED.provider,
+            display_name = EXCLUDED.display_name,
+            timezone = EXCLUDED.timezone,
+            status = EXCLUDED.status,
+            last_sync_at = COALESCE(EXCLUDED.last_sync_at, profile_accounts.last_sync_at),
+            updated_at = NOW()
+      RETURNING
+        id,
+        profile_id AS "profileId",
+        provider,
+        email,
+        display_name AS "displayName",
+        timezone,
+        status,
+        last_sync_at AS "lastSyncAt",
+        created_at AS "createdAt",
+        updated_at AS "updatedAt"
+    `,
+    [
+      account.id,
+      account.profileId,
+      account.provider ?? 'MICROSOFT',
+      account.email,
+      account.displayName ?? null,
+      account.timezone ?? 'UTC',
+      account.status ?? 'ACTIVE',
+      account.lastSyncAt ?? null,
+    ],
+  );
+  return rows[0];
+}
+
+export async function touchProfileAccount(id: string, lastSyncAt?: string) {
+  await pool.query(
+    `
+      UPDATE profile_accounts
+      SET last_sync_at = $2,
+          updated_at = NOW()
+      WHERE id = $1
+    `,
+    [id, lastSyncAt ?? new Date().toISOString()],
+  );
 }
 
 export async function updateProfileRecord(profile: {

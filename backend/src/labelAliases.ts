@@ -1,5 +1,7 @@
 import { LabelAlias } from './types';
 
+export const APPLICATION_SUCCESS_KEY = 'application_success';
+
 export const DEFAULT_LABEL_ALIASES: Record<string, string[]> = {
   // ===== Personal identity =====
   full_name: [
@@ -98,6 +100,37 @@ export const DEFAULT_LABEL_ALIASES: Record<string, string[]> = {
   eeo_race_ethnicity: ['race', 'ethnicity', 'race/ethnicity'],
   eeo_veteran: ['veteran', 'protected veteran'],
   eeo_disability: ['disability', 'disability status'],
+
+  // ===== Application success phrases =====
+  [APPLICATION_SUCCESS_KEY]: [
+    'application submitted',
+    'application received',
+    'application sent',
+    'your application has been submitted',
+    'your application was submitted',
+    'we received your application',
+    'applied',
+    'applied successfully',
+    'already applied',
+    'you have applied',
+    'submitted',
+    'submission complete',
+    'submission successful',
+    'thank you for applying',
+    'thanks for applying',
+    'thank you for your application',
+    'thank you for submitting',
+    'we appreciate your interest',
+    'thanks for your interest',
+    'your interest has been received',
+    'application confirmation',
+    'submission confirmation',
+    'proposal confirmation',
+    "you're all set",
+    'all done',
+    'next steps',
+    'what happens next',
+  ],
 };
 
 export const CANONICAL_LABEL_KEYS = new Set(Object.keys(DEFAULT_LABEL_ALIASES));
@@ -121,11 +154,15 @@ export function buildAliasIndex(customAliases: LabelAlias[] = []) {
   };
 
   for (const [canonical, aliases] of Object.entries(DEFAULT_LABEL_ALIASES)) {
+    if (canonical === APPLICATION_SUCCESS_KEY) continue;
     add(canonical, canonical);
     aliases.forEach((alias) => add(canonical, alias));
   }
 
-  customAliases.forEach((alias) => add(alias.canonicalKey, alias.alias));
+  customAliases.forEach((alias) => {
+    if (alias.canonicalKey === APPLICATION_SUCCESS_KEY) return;
+    add(alias.canonicalKey, alias.alias);
+  });
   return index;
 }
 
@@ -135,4 +172,17 @@ export function matchLabelToCanonical(label: string | null | undefined, aliasInd
   if (!normalized) return undefined;
   const squished = normalized.replace(/\s+/g, '');
   return aliasIndex.get(normalized) ?? aliasIndex.get(squished);
+}
+
+export function buildApplicationSuccessPhrases(customAliases: LabelAlias[] = []) {
+  const defaults = DEFAULT_LABEL_ALIASES[APPLICATION_SUCCESS_KEY] ?? [];
+  const custom = customAliases
+    .filter((alias) => alias.canonicalKey === APPLICATION_SUCCESS_KEY)
+    .map((alias) => alias.alias);
+  const merged = new Set<string>();
+  for (const phrase of [...defaults, ...custom]) {
+    const trimmed = phrase.trim();
+    if (trimmed) merged.add(trimmed);
+  }
+  return Array.from(merged);
 }

@@ -12,7 +12,17 @@ import bcrypt from 'bcryptjs';
 import pdfParse from 'pdf-parse';
 import { extractRawText } from 'mammoth';
 import { events, llmSettings, sessions } from './data';
-import { ApplicationSession, Assignment, BaseInfo, LabelAlias, Resume, SessionStatus, User, UserRole } from './types';
+import {
+  ApplicationRecord,
+  ApplicationSession,
+  Assignment,
+  BaseInfo,
+  LabelAlias,
+  Resume,
+  SessionStatus,
+  User,
+  UserRole,
+} from './types';
 import { authGuard, forbidObserver, signToken } from './auth';
 import {
   closeAssignmentById,
@@ -32,6 +42,7 @@ import {
   upsertProfileAccount,
   touchProfileAccount,
   insertLabelAlias,
+  insertApplication,
   insertAssignmentRecord,
   insertResumeRecord,
   insertUser,
@@ -45,7 +56,14 @@ import {
   updateProfileRecord,
   updateLabelAliasRecord,
 } from './db';
-import { CANONICAL_LABEL_KEYS, DEFAULT_LABEL_ALIASES, buildAliasIndex, matchLabelToCanonical, normalizeLabelAlias } from './labelAliases';
+import {
+  CANONICAL_LABEL_KEYS,
+  DEFAULT_LABEL_ALIASES,
+  buildAliasIndex,
+  buildApplicationSuccessPhrases,
+  matchLabelToCanonical,
+  normalizeLabelAlias,
+} from './labelAliases';
 import { analyzeJobFromHtml, callPromptPack, promptBuilders } from './resumeClassifier';
 import { loadOutlookEvents } from './msGraph';
 
@@ -66,6 +84,17 @@ type FillPlanResult = {
   filled?: { field: string; value: string; confidence?: number }[];
   suggestions?: { field: string; suggestion: string }[];
   blocked?: string[];
+  actions?: FillPlanAction[];
+};
+
+type FillPlanAction = {
+  field: string;
+  field_id?: string;
+  label?: string;
+  selector?: string;
+  action: 'fill' | 'select' | 'check' | 'uncheck' | 'click' | 'upload' | 'skip';
+  value?: string;
+  confidence?: number;
 };
 
 function trimString(val: unknown): string {
@@ -123,7 +152,6 @@ function computeHourlyRate(desiredSalary?: string | number | null) {
 function buildAutofillValueMap(
   baseInfo: BaseInfo,
   jobContext?: Record<string, unknown>,
-  parsedResume?: any,
 ): Record<string, string> {
   const firstName = trimString(baseInfo?.name?.first);
   const lastName = trimString(baseInfo?.name?.last);
@@ -137,11 +165,11 @@ function buildAutofillValueMap(
   const state = trimString(baseInfo?.location?.state);
   const country = trimString(baseInfo?.location?.country);
   const postalCode = trimString(baseInfo?.location?.postalCode);
-  const linkedin = trimString(baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin);
+  const linkedin = trimString(baseInfo?.links?.linkedin);
   const jobTitle = trimString(baseInfo?.career?.jobTitle) || trimString((jobContext as any)?.job_title);
   const currentCompany =
     trimString(baseInfo?.career?.currentCompany) || trimString((jobContext as any)?.company) || trimString((jobContext as any)?.employer);
-  const yearsExp = trimString(baseInfo?.career?.yearsExp ?? parsedResume?.years_experience_general);
+  const yearsExp = trimString(baseInfo?.career?.yearsExp);
   const desiredSalary = trimString(baseInfo?.career?.desiredSalary);
   const hourlyRate = computeHourlyRate(desiredSalary);
   const school = trimString(baseInfo?.education?.school);
@@ -764,17 +792,40 @@ function collectLabelCandidates(field: any): string[] {
   return candidates;
 }
 
+function escapeCssValue(value: string) {
+  return value.replace(/["\\]/g, '\\$&');
+}
+
+function escapeCssIdent(value: string) {
+  return value.replace(/[^a-zA-Z0-9_-]/g, '\\$&');
+}
+
+function buildFieldSelector(field: any): string | undefined {
+  if (field?.selector && typeof field.selector === 'string') return field.selector;
+  if (field?.locators?.css && typeof field.locators.css === 'string') return field.locators.css;
+  if (field?.id) return `#${escapeCssIdent(String(field.id))}`;
+  if (field?.field_id) return `[name="${escapeCssValue(String(field.field_id))}"]`;
+  if (field?.name) return `[name="${escapeCssValue(String(field.name))}"]`;
+  return undefined;
+}
+
+function inferFieldAction(field: any): FillPlanAction['action'] {
+  const rawType = String(field?.type ?? '').toLowerCase();
+  if (rawType === 'select') return 'select';
+  return 'fill';
+}
+
 const SKIP_KEYS = new Set(['cover_letter']);
 
-async function fillFieldsWithAliases(
-  page: Page | undefined | null,
+function buildAliasFillPlan(
   fields: any[],
   aliasIndex: Map<string, string>,
   valueMap: Record<string, string>,
-): Promise<FillPlanResult> {
+): FillPlanResult {
   const filled: { field: string; value: string; confidence?: number }[] = [];
   const suggestions: { field: string; suggestion: string }[] = [];
   const blocked: string[] = [];
+  const actions: FillPlanAction[] = [];
   const seen = new Set<string>();
 
   for (const field of fields ?? []) {
@@ -802,75 +853,29 @@ async function fillFieldsWithAliases(
       continue;
     }
 
-    const selector = field?.selector || field?.locators?.css;
-    const labelText = matchedLabel || field?.label || field?.questionText || field?.ariaName || fieldName;
-    const tryFrames = page
-      ? (() => {
-          const main = page.mainFrame();
-          const frames = page.frames().filter((f) => f !== main);
-          return [main, ...frames];
-        })()
-      : [];
-    const tryFill = async (): Promise<boolean> => {
-      if (!page || !selector) return false;
-      for (const targetFrame of tryFrames) {
-        try {
-          const trySelectByLabel = async () => targetFrame.selectOption(selector, { label: value });
-          const trySelectByValue = async () => targetFrame.selectOption(selector, { value });
-          const trySelectByGetByLabel = async () => {
-            const lbl = labelText?.trim();
-            if (!lbl) throw new Error('no label for select');
-            await targetFrame.getByLabel(lbl, { exact: false }).selectOption({ label: value }).catch(async () => {
-              await targetFrame.getByLabel(lbl, { exact: false }).selectOption({ value });
-            });
-          };
-          const tryFillByLabel = async () => {
-            const lbl = labelText?.trim();
-            if (!lbl) throw new Error('no label for fill');
-            await targetFrame.getByLabel(lbl, { exact: false }).fill(value);
-          };
-
-          if (field?.type === 'select') {
-            const opt = await targetFrame.$(selector);
-            if (opt) {
-              await trySelectByLabel()
-                .catch(trySelectByValue)
-                .catch(async () => {
-                  await targetFrame.selectOption(selector, { label: value }).catch(async () => {
-                    await targetFrame.selectOption(selector, { value }).catch(async () => {
-                      await opt.focus();
-                      await targetFrame.keyboard.type(value);
-                    });
-                  });
-                })
-                .catch(() => trySelectByGetByLabel().catch(() => {}));
-            } else {
-              await trySelectByGetByLabel();
-            }
-          } else {
-            await targetFrame.fill(selector, value).catch(async () => {
-              await tryFillByLabel();
-            });
-          }
-          return true;
-        } catch {
-          continue;
-        }
-      }
-      return false;
-    };
-
-    const success = await tryFill();
-    if (success) {
-      filled.push({ field: fieldName, value, confidence: 0.9 });
-    } else if (!page) {
-      filled.push({ field: fieldName, value, confidence: 0.75 });
-    } else {
+    const selector = buildFieldSelector(field);
+    const fieldId = trimString(field?.field_id || field?.name || field?.id);
+    const fieldLabel = trimString(
+      matchedLabel || field?.label || field?.questionText || field?.ariaName || fieldName,
+    );
+    if (!selector) {
       blocked.push(fieldName);
+      continue;
     }
+    const action = inferFieldAction(field);
+    actions.push({
+      field: fieldName,
+      field_id: fieldId || undefined,
+      label: fieldLabel || undefined,
+      selector,
+      action,
+      value,
+      confidence: 0.75,
+    });
+    filled.push({ field: fieldName, value, confidence: 0.75 });
   }
 
-  return { filled, suggestions, blocked };
+  return { filled, suggestions, blocked, actions };
 }
 
 function shouldSkipPlanField(field: any, aliasIndex: Map<string, string>) {
@@ -882,7 +887,7 @@ function shouldSkipPlanField(field: any, aliasIndex: Map<string, string>) {
   return false;
 }
 
-async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any): Promise<FillPlanResult> {
+async function simplePageFill(page: Page, baseInfo: BaseInfo): Promise<FillPlanResult> {
   const fullName = [baseInfo?.name?.first, baseInfo?.name?.last].filter(Boolean).join(' ').trim();
   const email = trimString(baseInfo?.contact?.email);
   const phoneCode = trimString(baseInfo?.contact?.phoneCode);
@@ -893,12 +898,10 @@ async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any
   const state = trimString(baseInfo?.location?.state);
   const country = trimString(baseInfo?.location?.country);
   const postalCode = trimString(baseInfo?.location?.postalCode);
-  const linkedin = trimString(baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin);
-  const company = trimString(
-    baseInfo?.career?.currentCompany || parsedResume?.experience?.[0]?.company || parsedResume?.experience?.[0]?.employer,
-  );
-  const title = trimString(baseInfo?.career?.jobTitle || parsedResume?.experience?.[0]?.title);
-  const yearsExp = trimString(baseInfo?.career?.yearsExp ?? parsedResume?.years_experience_general);
+  const linkedin = trimString(baseInfo?.links?.linkedin);
+  const company = trimString(baseInfo?.career?.currentCompany);
+  const title = trimString(baseInfo?.career?.jobTitle);
+  const yearsExp = trimString(baseInfo?.career?.yearsExp);
   const desiredSalary = trimString(baseInfo?.career?.desiredSalary);
   const school = trimString(baseInfo?.education?.school);
   const degree = trimString(baseInfo?.education?.degree);
@@ -1730,6 +1733,13 @@ async function bootstrap() {
     return { defaults: DEFAULT_LABEL_ALIASES, custom };
   });
 
+  app.get('/application-phrases', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const custom = await listLabelAliases();
+    const phrases = buildApplicationSuccessPhrases(custom);
+    return { phrases };
+  });
+
   app.post('/label-aliases', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
@@ -1827,16 +1837,11 @@ async function bootstrap() {
       session.selectedResumeId = body.selectedResumeId;
     }
 
-    const profileResumes = await listResumesByProfile(session.profileId);
-    const resumeId =
-      session.selectedResumeId ?? session.recommendedResumeId ?? body.selectedResumeId ?? profileResumes[0]?.id;
-    const resumeRecord = resumeId ? await findResumeById(resumeId) : undefined;
-    const hydratedResume = resumeRecord ? await hydrateResume(resumeRecord, profile.baseInfo) : undefined;
-
     const live = livePages.get(id);
     const page = live?.page;
-    let pageFields: any[] = [];
-    if (page) {
+    const hasClientFields = Array.isArray(body.pageFields);
+    let pageFields: any[] = hasClientFields ? body.pageFields : [];
+    if (!hasClientFields && page) {
       try {
         pageFields = await collectPageFields(page);
       } catch (err) {
@@ -1844,54 +1849,53 @@ async function bootstrap() {
       }
     }
 
-    const candidateFields: any[] =
-      Array.isArray(body.pageFields) && body.pageFields.length > 0
-        ? body.pageFields
-        : pageFields.length
-          ? pageFields
-          : DEFAULT_AUTOFILL_FIELDS;
+    const candidateFields: any[] = pageFields.length ? pageFields : DEFAULT_AUTOFILL_FIELDS;
 
-    const autofillValues = buildAutofillValueMap(profile.baseInfo ?? {}, session.jobContext ?? {}, hydratedResume?.parsedResume);
+    const autofillValues = buildAutofillValueMap(profile.baseInfo ?? {}, session.jobContext ?? {});
     const aliasIndex = buildAliasIndex(await listLabelAliases());
     const useLlm = body.useLlm !== false;
 
-    let fillPlan: FillPlanResult = { filled: [], suggestions: [], blocked: [] };
+    let fillPlan: FillPlanResult = { filled: [], suggestions: [], blocked: [], actions: [] };
     if (candidateFields.length > 0) {
       try {
-        fillPlan = await fillFieldsWithAliases(page, candidateFields, aliasIndex, autofillValues);
+        fillPlan = buildAliasFillPlan(candidateFields, aliasIndex, autofillValues);
       } catch (err) {
         request.log.error({ err }, 'label-db autofill failed');
-        fillPlan = { filled: [], suggestions: [], blocked: [] };
+        fillPlan = { filled: [], suggestions: [], blocked: [], actions: [] };
       }
     }
 
     try {
-      if (useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && hydratedResume?.resumeText && candidateFields.length > 0) {
+      if (useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && candidateFields.length > 0) {
         const prompt = promptBuilders.buildAutofillPlanPrompt({
           pageFields: candidateFields,
           baseProfile: profile.baseInfo ?? {},
           prefs: {},
           jobContext: session.jobContext ?? {},
-          selectedResume: {
-            resume_id: hydratedResume.id,
-            label: hydratedResume.label,
-            parsed_resume_json: hydratedResume.parsedResume ?? {},
-            resume_text: hydratedResume.resumeText,
-          },
           pageContext: { url: session.url },
         });
         const parsed = await callPromptPack(prompt);
         const llmPlan = parsed?.result?.fill_plan;
         if (Array.isArray(llmPlan)) {
-        const filteredPlan = llmPlan.filter((f: any) => !shouldSkipPlanField(f, aliasIndex));
-        const applied = page ? await applyFillPlan(page, filteredPlan) : { filled: [], blocked: [], suggestions: [] };
-        const filledFromPlan = filteredPlan
-          .filter((f: any) => (f.action === 'fill' || f.action === 'select') && f.value)
-          .map((f: any) => ({
-            field: f.field_id ?? f.selector ?? f.label ?? 'field',
-            value: typeof f.value === 'string' ? f.value : JSON.stringify(f.value ?? ''),
-            confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
-          }));
+          const filteredPlan = llmPlan.filter((f: any) => !shouldSkipPlanField(f, aliasIndex));
+          const actions: FillPlanAction[] = filteredPlan
+            .map((f: any) => ({
+              field: String(f.field_id ?? f.selector ?? f.label ?? 'field'),
+              field_id: typeof f.field_id === 'string' ? f.field_id : undefined,
+              label: typeof f.label === 'string' ? f.label : undefined,
+              selector: typeof f.selector === 'string' ? f.selector : undefined,
+              action: (f.action as FillPlanAction['action']) ?? 'fill',
+              value: typeof f.value === 'string' ? f.value : JSON.stringify(f.value ?? ''),
+              confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
+            }))
+            .filter((f) => f.action !== 'skip');
+          const filledFromPlan = actions
+            .filter((f) => ['fill', 'select', 'check', 'uncheck'].includes(f.action))
+            .map((f) => ({
+              field: f.field,
+              value: f.value ?? '',
+              confidence: f.confidence,
+            }));
           const suggestions =
             (Array.isArray(parsed?.warnings) ? parsed?.warnings : []).map((w: any) => ({
               field: 'note',
@@ -1901,30 +1905,15 @@ async function bootstrap() {
             .filter((f: any) => f.requires_user_review)
             .map((f: any) => f.field_id ?? f.selector ?? 'field');
           fillPlan = {
-            filled: [...filledFromPlan, ...(applied.filled ?? [])],
-            suggestions: [...suggestions, ...(applied.suggestions ?? [])],
-            blocked: [...blocked, ...(applied.blocked ?? [])],
+            filled: filledFromPlan,
+            suggestions,
+            blocked,
+            actions,
           };
-          if ((!fillPlan.filled || fillPlan.filled.length === 0) && page) {
-            const simple = await simplePageFill(page, profile.baseInfo, hydratedResume.parsedResume);
-            fillPlan = {
-              filled: [...(fillPlan.filled ?? []), ...(simple.filled ?? [])],
-              suggestions: [...(fillPlan.suggestions ?? []), ...(simple.suggestions ?? [])],
-              blocked: [...(fillPlan.blocked ?? []), ...(simple.blocked ?? [])],
-            };
-          }
         }
       }
     } catch (err) {
       request.log.error({ err }, 'LLM autofill failed, using demo plan');
-    }
-
-    if (!useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && page && candidateFields.length > 0) {
-      try {
-        fillPlan = await simplePageFill(page, profile.baseInfo, hydratedResume?.parsedResume);
-      } catch (e) {
-        request.log.error({ err: e }, 'simplePageFill failed');
-      }
     }
 
     if (!fillPlan.filled?.length && !fillPlan.suggestions?.length && !fillPlan.blocked?.length) {
@@ -1932,7 +1921,6 @@ async function bootstrap() {
     }
 
     session.status = 'FILLED';
-    session.selectedResumeId = resumeId ?? session.selectedResumeId;
     session.fillPlan = fillPlan;
     events.push({
       id: randomUUID(),
@@ -1951,6 +1939,21 @@ async function bootstrap() {
     if (!session) return reply.status(404).send({ message: 'Session not found' });
     session.status = 'SUBMITTED';
     session.endedAt = new Date().toISOString();
+    try {
+      const record: ApplicationRecord = {
+        id: randomUUID(),
+        sessionId: id,
+        bidderUserId: session.bidderUserId,
+        profileId: session.profileId,
+        resumeId: session.selectedResumeId ?? session.recommendedResumeId ?? null,
+        url: session.url ?? '',
+        domain: session.domain ?? tryExtractDomain(session.url ?? ''),
+        createdAt: new Date().toISOString(),
+      };
+      await insertApplication(record);
+    } catch (err) {
+      request.log.error({ err }, 'failed to insert application record');
+    }
     await stopBrowserSession(id);
     events.push({
       id: randomUUID(),
@@ -2146,6 +2149,7 @@ function buildDemoFillPlan(baseInfo: BaseInfo): FillPlanResult {
     filled,
     suggestions: [],
     blocked: ['EEO', 'veteran_status', 'disability'],
+    actions: [],
   };
 }
 

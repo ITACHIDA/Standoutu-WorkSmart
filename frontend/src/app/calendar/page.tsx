@@ -119,7 +119,7 @@ export default function CalendarPage() {
   return (
     <main className="min-h-screen bg-gradient-to-b from-[#eaf2ff] via-[#f4f7ff] to-white text-slate-900">
       <TopNav />
-      <div className="mx-auto flex w-full max-w-6xl flex-col gap-6 px-6 py-8">
+      <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-6 px-4 py-6">
         {/* <div className="overflow-hidden rounded-3xl border border-slate-200/60 bg-white/90 shadow-[0_20px_80px_-50px_rgba(15,23,42,0.6)]">
           <div className="bg-gradient-to-r from-sky-50 via-white to-indigo-50 px-8 py-8">
             <div className="flex flex-col gap-4 md:flex-row md:items-center md:justify-between">

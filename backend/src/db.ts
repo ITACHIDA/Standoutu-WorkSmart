@@ -1,5 +1,6 @@
 import { Pool } from 'pg';
 import {
+  ApplicationRecord,
   Assignment,
   LabelAlias,
   Profile,
@@ -66,6 +67,17 @@ export async function initDb() {
         ended_at TIMESTAMP
       );
 
+      CREATE TABLE IF NOT EXISTS applications (
+        id UUID PRIMARY KEY,
+        session_id UUID UNIQUE,
+        bidder_user_id UUID,
+        profile_id UUID,
+        resume_id UUID,
+        url TEXT,
+        domain TEXT,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS events (
         id UUID PRIMARY KEY,
         session_id UUID,
@@ -109,6 +121,8 @@ export async function initDb() {
       );
 
       CREATE INDEX IF NOT EXISTS idx_profile_accounts_profile ON profile_accounts(profile_id);
+      CREATE INDEX IF NOT EXISTS idx_applications_bidder ON applications(bidder_user_id);
+      CREATE INDEX IF NOT EXISTS idx_applications_profile ON applications(profile_id);
 
       -- Backfill schema changes at startup to avoid missing migration runs.
       ALTER TABLE IF EXISTS resumes
@@ -181,6 +195,35 @@ export async function insertProfile(profile: {
       profile.createdBy ?? null,
       profile.createdAt ?? new Date().toISOString(),
       profile.updatedAt ?? new Date().toISOString(),
+    ],
+  );
+}
+
+export async function insertApplication(record: ApplicationRecord) {
+  await pool.query(
+    `
+      INSERT INTO applications (
+        id,
+        session_id,
+        bidder_user_id,
+        profile_id,
+        resume_id,
+        url,
+        domain,
+        created_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      ON CONFLICT (session_id) DO NOTHING
+    `,
+    [
+      record.id,
+      record.sessionId,
+      record.bidderUserId,
+      record.profileId,
+      record.resumeId ?? null,
+      record.url,
+      record.domain ?? null,
+      record.createdAt,
     ],
   );
 }

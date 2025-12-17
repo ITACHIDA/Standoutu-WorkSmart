@@ -17,7 +17,7 @@ export default function AdminShell({ children }: { children: React.ReactNode }) 
   return (
     <main className="min-h-screen bg-white text-slate-900">
       <TopNav />
-      <div className="mx-auto w-full max-w-7xl px-6 py-8">
+      <div className="mx-auto w-full max-w-screen-2xl px-4 py-6">
         <div className="mb-4 flex items-center justify-between">
           <div className="text-sm text-slate-500">Admin console</div>
           <button

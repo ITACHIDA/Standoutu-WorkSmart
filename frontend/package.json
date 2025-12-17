@@ -14,8 +14,8 @@
     "@fullcalendar/interaction": "^6.1.19",
     "@fullcalendar/react": "^6.1.19",
     "@fullcalendar/timegrid": "^6.1.19",
+    "next": "^16.0.10",
     "next-auth": "^4.24.6",
-    "next": "16.0.8",
     "react": "19.2.1",
     "react-dom": "19.2.1"
   },

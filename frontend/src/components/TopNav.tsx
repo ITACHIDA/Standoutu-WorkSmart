@@ -46,7 +46,7 @@ export default function TopNav() {
 
   return (
     <header className="w-full border-b border-white/5 bg-[#0b1020] backdrop-blur">
-      <div className="mx-auto flex w-full max-w-7xl items-center justify-between px-6 py-4 text-sm">
+      <div className="mx-auto flex w-full max-w-screen-2xl items-center justify-between px-4 py-3 text-sm">
         <div className="text-lg font-semibold text-white">
           <Link href="/">SmartWork</Link>
         </div>

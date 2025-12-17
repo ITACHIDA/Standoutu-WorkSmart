@@ -161,7 +161,7 @@ export default function LabelAliasesPage() {
           <p className="text-[11px] uppercase tracking-[0.28em] text-slate-500">Admin</p>
           <h1 className="text-3xl font-semibold text-slate-900">Label tags</h1>
           <p className="text-sm text-slate-600">
-            Choose a label on the left and manage its tags on the right. Built-ins stay read-only; add or edit the tags we match in autofill.
+            Choose a label on the left and manage its tags on the right. Built-ins stay read-only; add or edit tags used for autofill and application confirmation checks.
           </p>
         </div>
 

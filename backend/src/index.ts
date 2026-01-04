@@ -13,6 +13,7 @@ import { chromium, Browser, Page, Frame } from "playwright";
 import bcrypt from "bcryptjs";
 import pdfParse from "pdf-parse";
 import { extractRawText } from "mammoth";
+import { config } from "./config";
 import { events, llmSettings, sessions } from "./data";
 import {
   ApplicationRecord,
@@ -104,17 +105,12 @@ import {
 } from "./resumeClassifier";
 import { loadOutlookEvents } from "./msGraph";
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
+const PORT = config.PORT;
 const app = fastify({ logger: true });
 const PROJECT_ROOT = path.join(__dirname, "..");
-const RESUME_DIR =
-  process.env.RESUME_DIR ?? path.join(PROJECT_ROOT, "data", "resumes");
-const HF_TOKEN =
-  process.env.HF_TOKEN ||
-  process.env.HUGGINGFACEHUB_API_TOKEN ||
-  process.env.HUGGING_FACE_TOKEN ||
-  "";
-const HF_MODEL = process.env.HF_MODEL || "meta-llama/Meta-Llama-3-8B-Instruct";
+const RESUME_DIR = config.RESUME_DIR || path.join(PROJECT_ROOT, "data", "resumes");
+const HF_TOKEN = config.HF_TOKEN;
+const HF_MODEL = config.HF_MODEL;
 
 const livePages = new Map<
   string,
@@ -1376,7 +1372,7 @@ const DEFAULT_AUTOFILL_FIELDS = [
 
 async function bootstrap() {
   await app.register(authGuard);
-  await app.register(cors, { origin: true });
+  await app.register(cors, { origin: config.CORS_ORIGINS, credentials: true });
   await app.register(websocket);
   await app.register(multipart, {
     limits: {

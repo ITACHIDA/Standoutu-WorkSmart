@@ -6,6 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "dev:mode": "ts-node-dev src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
     "lint": "echo \"add eslint if needed\""
@@ -30,6 +31,7 @@
   "devDependencies": {
     "@types/bcryptjs": "^2.4.6",
     "@types/node": "^22.7.0",
+    "@types/pdf-parse": "^1.1.5",
     "@types/pg": "^8.16.0",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",

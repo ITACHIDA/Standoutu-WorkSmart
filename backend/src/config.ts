@@ -1,0 +1,37 @@
+import "dotenv/config";
+
+export const config = {
+  PORT: process.env.PORT ? Number(process.env.PORT) : 4000,
+  
+  DATABASE_URL: process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/ops_db',
+  
+  CORS_ORIGINS: [
+    'http://localhost:3000',
+    'http://localhost:4000',
+    'http://127.0.0.1:3000',
+    'http://127.0.0.1:4000',
+  ] as string[],
+  
+  RESUME_DIR: process.env.RESUME_DIR || '',
+  
+  HF_TOKEN: process.env.HF_TOKEN || 
+    process.env.HUGGINGFACEHUB_API_TOKEN || 
+    process.env.HUGGING_FACE_TOKEN || 
+    '',
+  
+  HF_MODEL: process.env.HF_MODEL || 'meta-llama/Meta-Llama-3-8B-Instruct',
+  
+  SUPABASE_URL: process.env.SUPABASE_URL || '',
+  SUPABASE_KEY: process.env.SUPABASE_PUBLISHABLE_KEY || '',
+  SUPABASE_BUCKET: process.env.COMMUNITY_FILES_BUCKET_STORAGE || 'community-files',
+  
+  ENCRYPTION_KEY: process.env.ENCRYPTION_KEY || 'dev-smartwork-change-me',
+  
+  MS_CLIENT_ID: process.env.MS_CLIENT_ID || '',
+  MS_CLIENT_SECRET: process.env.MS_CLIENT_SECRET || '',
+  MS_TENANT_ID: process.env.MS_TENANT_ID || 'common',
+  MS_REDIRECT_URI: process.env.MS_REDIRECT_URI || '',
+  
+  NEXTAUTH_URL: process.env.NEXTAUTH_URL || '',
+  NEXTAUTH_SECRET: process.env.NEXTAUTH_SECRET || '',
+};

@@ -11,6 +11,7 @@ export default function ManagerShell({ children }: { children: React.ReactNode }
   const links = [
     { href: "/manager/profiles", label: "Profile management" },
     { href: "/manager/bidders", label: "Bidder management" },
+    { href: "/manager/applications", label: "Application management" },
   ];
 
   return (

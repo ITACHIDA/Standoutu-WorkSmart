@@ -46,6 +46,7 @@ import {
   insertAssignmentRecord,
   insertResumeRecord,
   insertUser,
+  listApplications,
   listAssignments,
   listBidderSummaries,
   listLabelAliases,
@@ -2057,6 +2058,16 @@ async function bootstrap() {
       return reply.status(403).send({ message: 'Only managers or admins can view bidders' });
     }
     const rows = await listBidderSummaries();
+    return rows;
+  });
+
+  app.get('/manager/applications', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
+      return reply.status(403).send({ message: 'Only managers or admins can view applications' });
+    }
+    const rows = await listApplications();
     return rows;
   });
 

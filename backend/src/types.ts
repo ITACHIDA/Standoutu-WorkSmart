@@ -156,6 +156,21 @@ export interface ApplicationRecord {
   createdAt: string;
 }
 
+export interface ApplicationSummary {
+  id: string;
+  sessionId: string;
+  bidderUserId?: string | null;
+  bidderName?: string | null;
+  bidderEmail?: string | null;
+  profileId?: string | null;
+  profileDisplayName?: string | null;
+  resumeId?: string | null;
+  resumeLabel?: string | null;
+  url?: string | null;
+  domain?: string | null;
+  createdAt: string;
+}
+
 export type LlmProvider = 'OPENAI' | 'HUGGINGFACE';
 
 export interface LlmSettings {

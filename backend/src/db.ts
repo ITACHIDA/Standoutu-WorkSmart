@@ -1,6 +1,8 @@
+import { randomUUID } from 'crypto';
 import { Pool } from 'pg';
 import {
   ApplicationRecord,
+  ApplicationSummary,
   Assignment,
   LabelAlias,
   Profile,
@@ -9,6 +11,11 @@ import {
   Resume,
   User,
 } from './types';
+import {
+  APPLICATION_SUCCESS_DEFAULTS,
+  APPLICATION_SUCCESS_KEY,
+  normalizeLabelAlias,
+} from './labelAliases';
 
 export const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -120,6 +127,11 @@ export async function initDb() {
         UNIQUE (profile_id, email)
       );
 
+      CREATE TABLE IF NOT EXISTS seed_flags (
+        key TEXT PRIMARY KEY,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
       CREATE INDEX IF NOT EXISTS idx_profile_accounts_profile ON profile_accounts(profile_id);
       CREATE INDEX IF NOT EXISTS idx_applications_bidder ON applications(bidder_user_id);
       CREATE INDEX IF NOT EXISTS idx_applications_profile ON applications(profile_id);
@@ -140,6 +152,33 @@ export async function initDb() {
 
       DROP TABLE IF EXISTS assignments;
     `);
+
+    const seedKey = 'application_phrases_seed';
+    const { rows: seedRows } = await client.query<{ key: string }>(
+      'SELECT key FROM seed_flags WHERE key = $1',
+      [seedKey],
+    );
+    if (seedRows.length === 0) {
+      const { rows: existing } = await client.query<{ id: string }>(
+        'SELECT id FROM label_aliases WHERE canonical_key = $1 LIMIT 1',
+        [APPLICATION_SUCCESS_KEY],
+      );
+      if (existing.length === 0) {
+        for (const phrase of APPLICATION_SUCCESS_DEFAULTS) {
+          const normalized = normalizeLabelAlias(phrase);
+          if (!normalized) continue;
+          await client.query(
+            `
+              INSERT INTO label_aliases (id, canonical_key, alias, normalized_alias)
+              VALUES ($1, $2, $3, $4)
+              ON CONFLICT (normalized_alias) DO NOTHING
+            `,
+            [randomUUID(), APPLICATION_SUCCESS_KEY, phrase, normalized],
+          );
+        }
+      }
+      await client.query('INSERT INTO seed_flags (key) VALUES ($1)', [seedKey]);
+    }
 
     // No seed data inserted; database starts empty.
   } finally {
@@ -571,6 +610,32 @@ export async function listBidderSummaries(): Promise<BidderSummary[]> {
     email: r.email,
     profiles: r.profiles ?? [],
   }));
+}
+
+export async function listApplications(): Promise<ApplicationSummary[]> {
+  const { rows } = await pool.query<ApplicationSummary>(
+    `
+      SELECT
+        a.id,
+        a.session_id AS "sessionId",
+        a.bidder_user_id AS "bidderUserId",
+        u.name AS "bidderName",
+        u.email AS "bidderEmail",
+        a.profile_id AS "profileId",
+        p.display_name AS "profileDisplayName",
+        a.resume_id AS "resumeId",
+        r.label AS "resumeLabel",
+        a.url AS "url",
+        a.domain AS "domain",
+        a.created_at AS "createdAt"
+      FROM applications a
+      LEFT JOIN users u ON u.id = a.bidder_user_id
+      LEFT JOIN profiles p ON p.id = a.profile_id
+      LEFT JOIN resumes r ON r.id = a.resume_id
+      ORDER BY a.created_at DESC
+    `,
+  );
+  return rows;
 }
 
 export async function listLabelAliases(): Promise<LabelAlias[]> {

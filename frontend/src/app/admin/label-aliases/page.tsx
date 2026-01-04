@@ -23,6 +23,8 @@ type TagRow = {
   id?: string;
 };
 
+const APPLICATION_SUCCESS_KEY = "application_success";
+
 export default function LabelAliasesPage() {
   const router = useRouter();
   const { user, token, loading } = useAuth();
@@ -55,7 +57,9 @@ export default function LabelAliasesPage() {
     const set = new Set<string>();
     Object.keys(defaults || {}).forEach((k) => set.add(k));
     custom.forEach((c) => set.add(c.canonicalKey));
-    return Array.from(set).sort();
+    return Array.from(set)
+      .filter((key) => key !== APPLICATION_SUCCESS_KEY)
+      .sort();
   }, [defaults, custom]);
 
   async function loadAliases(authToken: string) {
@@ -66,12 +70,22 @@ export default function LabelAliasesPage() {
       setDefaults(nextDefaults);
       setCustom(nextCustom);
       if (!selectedKey) {
-        const allKeys = new Set<string>([
-          ...Object.keys(nextDefaults),
-          ...nextCustom.map((c) => c.canonicalKey),
-        ]);
+        const allKeys = new Set<string>(
+          [...Object.keys(nextDefaults), ...nextCustom.map((c) => c.canonicalKey)].filter(
+            (key) => key !== APPLICATION_SUCCESS_KEY
+          )
+        );
         const firstKey = Array.from(allKeys)[0] || "";
         setSelectedKey(firstKey);
+      } else if (selectedKey === APPLICATION_SUCCESS_KEY) {
+        const fallback = Array.from(
+          new Set<string>(
+            [...Object.keys(nextDefaults), ...nextCustom.map((c) => c.canonicalKey)].filter(
+              (key) => key !== APPLICATION_SUCCESS_KEY
+            )
+          )
+        )[0];
+        setSelectedKey(fallback ?? "");
       }
     } catch (err) {
       console.error(err);
@@ -161,7 +175,7 @@ export default function LabelAliasesPage() {
           <p className="text-[11px] uppercase tracking-[0.28em] text-slate-500">Admin</p>
           <h1 className="text-3xl font-semibold text-slate-900">Label tags</h1>
           <p className="text-sm text-slate-600">
-            Choose a label on the left and manage its tags on the right. Built-ins stay read-only; add or edit tags used for autofill and application confirmation checks.
+            Choose a label on the left and manage its tags on the right. Built-ins stay read-only; add or edit tags used for autofill.
           </p>
         </div>
 

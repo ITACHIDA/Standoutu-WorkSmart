@@ -1,6 +1,35 @@
 import { LabelAlias } from './types';
 
 export const APPLICATION_SUCCESS_KEY = 'application_success';
+export const APPLICATION_SUCCESS_DEFAULTS = [
+  'application submitted',
+  'application received',
+  'application sent',
+  'your application has been submitted',
+  'your application was submitted',
+  'we received your application',
+  'applied',
+  'applied successfully',
+  'already applied',
+  'you have applied',
+  'submitted',
+  'submission complete',
+  'submission successful',
+  'thank you for applying',
+  'thanks for applying',
+  'thank you for your application',
+  'thank you for submitting',
+  'we appreciate your interest',
+  'thanks for your interest',
+  'your interest has been received',
+  'application confirmation',
+  'submission confirmation',
+  'proposal confirmation',
+  "you're all set",
+  'all done',
+  'next steps',
+  'what happens next',
+];
 
 export const DEFAULT_LABEL_ALIASES: Record<string, string[]> = {
   // ===== Personal identity =====
@@ -102,35 +131,7 @@ export const DEFAULT_LABEL_ALIASES: Record<string, string[]> = {
   eeo_disability: ['disability', 'disability status'],
 
   // ===== Application success phrases =====
-  [APPLICATION_SUCCESS_KEY]: [
-    'application submitted',
-    'application received',
-    'application sent',
-    'your application has been submitted',
-    'your application was submitted',
-    'we received your application',
-    'applied',
-    'applied successfully',
-    'already applied',
-    'you have applied',
-    'submitted',
-    'submission complete',
-    'submission successful',
-    'thank you for applying',
-    'thanks for applying',
-    'thank you for your application',
-    'thank you for submitting',
-    'we appreciate your interest',
-    'thanks for your interest',
-    'your interest has been received',
-    'application confirmation',
-    'submission confirmation',
-    'proposal confirmation',
-    "you're all set",
-    'all done',
-    'next steps',
-    'what happens next',
-  ],
+  [APPLICATION_SUCCESS_KEY]: [],
 };
 
 export const CANONICAL_LABEL_KEYS = new Set(Object.keys(DEFAULT_LABEL_ALIASES));

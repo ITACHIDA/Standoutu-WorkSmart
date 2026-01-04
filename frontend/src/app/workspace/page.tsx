@@ -6,35 +6,8 @@ import { useRouter } from "next/navigation";
 import TopNav from "../../components/TopNav";
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:4000";
-const FALLBACK_APPLICATION_PHRASES = [
-  "application submitted",
-  "application received",
-  "application sent",
-  "your application has been submitted",
-  "your application was submitted",
-  "we received your application",
-  "applied",
-  "applied successfully",
-  "already applied",
-  "you have applied",
-  "submitted",
-  "submission complete",
-  "submission successful",
-  "thank you for applying",
-  "thanks for applying",
-  "thank you for your application",
-  "thank you for submitting",
-  "we appreciate your interest",
-  "thanks for your interest",
-  "your interest has been received",
-  "application confirmation",
-  "submission confirmation",
-  "proposal confirmation",
-  "you're all set",
-  "all done",
-  "next steps",
-  "what happens next",
-];
+const CONNECT_TIMEOUT_MS = 20000;
+const CHECK_TIMEOUT_MS = 10000;
 type DesktopBridge = {
   isElectron?: boolean;
   openJobWindow?: (url: string) => Promise<{ ok?: boolean; error?: string } | void>;
@@ -199,14 +172,11 @@ export default function Page() {
   const [session, setSession] = useState<ApplicationSession | null>(null);
   const [metrics, setMetrics] = useState<Metrics | null>(null);
   const [recommended, setRecommended] = useState<AnalyzeResult | null>(null);
-  const [applicationPhrases, setApplicationPhrases] = useState<string[]>(
-    FALLBACK_APPLICATION_PHRASES
-  );
+  const [applicationPhrases, setApplicationPhrases] = useState<string[]>([]);
   const [checkEnabled, setCheckEnabled] = useState(false);
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [streamFrame, setStreamFrame] = useState<string>("");
   const [status, setStatus] = useState<string>("Disconnected");
-  const [error, setError] = useState<string>("");
   const [loadingAction, setLoadingAction] = useState<string>("");
   const [streamConnected, setStreamConnected] = useState(false);
   const [analyzePopup, setAnalyzePopup] = useState<AnalyzePopupState | null>(null);
@@ -217,6 +187,12 @@ export default function Page() {
   const webviewRef = useRef<WebviewHandle | null>(null);
   const [isClient, setIsClient] = useState(false);
   const router = useRouter();
+  const showError = useCallback((message: string) => {
+    if (!message) return;
+    if (typeof window !== "undefined") {
+      window.alert(message);
+    }
+  }, []);
   const isBidder = user?.role === "BIDDER";
   const browserSrc = session?.url || url || "";
   const webviewPartition = "persist:smartwork-jobview";
@@ -738,28 +714,38 @@ export default function Page() {
   async function handleGo() {
     if (!user || !selectedProfileId || !url) return;
     setLoadingAction("go");
-    setError("");
     setCheckEnabled(false);
     try {
-      const newSession: ApplicationSession = await api("/sessions", {
-        method: "POST",
-        body: JSON.stringify({
-          bidderUserId: user.id,
-          profileId: selectedProfileId,
-          url,
-          selectedResumeId: resumeChoice,
+      const newSession: ApplicationSession = await withTimeout(
+        api("/sessions", {
+          method: "POST",
+          body: JSON.stringify({
+            bidderUserId: user.id,
+            profileId: selectedProfileId,
+            url,
+            selectedResumeId: resumeChoice,
+          }),
         }),
-      });
+        CONNECT_TIMEOUT_MS,
+        "Connecting timed out. Please try again."
+      );
       setSession(newSession);
       setStatus("Connecting to remote browser...");
-      await api(`/sessions/${newSession.id}/go`, { method: "POST" }).catch((err) => {
-        console.error(err);
-      });
+      await withTimeout(
+        api(`/sessions/${newSession.id}/go`, { method: "POST" }),
+        CONNECT_TIMEOUT_MS,
+        "Connecting timed out. Please try again."
+      );
       setStatus("Connected to remote browser");
       void refreshMetrics();
     } catch (err) {
       console.error(err);
-      setError("Failed to start session. Check backend logs.");
+      const message =
+        err instanceof Error && err.message
+          ? err.message
+          : "Failed to start session. Check backend logs.";
+      showError(message);
+      setStatus("Connection failed");
     } finally {
       setLoadingAction("");
     }
@@ -768,26 +754,33 @@ export default function Page() {
   async function handleCheck() {
     if (!session) return;
     setLoadingAction("check");
-    setError("");
     setCheckEnabled(false);
     let didSubmit = false;
     try {
       if (!isElectron) {
-        setError("Check is only available in the desktop app.");
+        showError("Check is only available in the desktop app.");
         return;
       }
       if (!webviewRef.current) {
-        setError("Embedded browser is not ready yet. Try again in a moment.");
+        showError("Embedded browser is not ready yet. Try again in a moment.");
         return;
       }
       if (webviewStatus === "failed") {
-        setError("Embedded browser failed to load. Try again or open in a browser tab.");
+        showError("Embedded browser failed to load. Try again or open in a browser tab.");
         return;
       }
-      const pageText = await collectWebviewText();
+      if (!applicationPhrases.length) {
+        showError("No check phrases configured. Ask an admin to add them.");
+        return;
+      }
+      const pageText = await withTimeout(
+        collectWebviewText(),
+        CHECK_TIMEOUT_MS,
+        "Check timed out. Please try again."
+      );
       const normalizedPage = normalizeTextForMatch(pageText);
       if (!normalizedPage) {
-        setError("No text found on the page to check yet.");
+        showError("No text found on the page to check yet.");
         return;
       }
       const squishedPage = normalizedPage.replace(/\s+/g, "");
@@ -797,10 +790,14 @@ export default function Page() {
           (phrase.squished && squishedPage.includes(phrase.squished))
       );
       if (!matchedPhrase) {
-        setError("No submission confirmation detected yet.");
+        showError("No submission confirmation detected yet.");
         return;
       }
-      await api(`/sessions/${session.id}/mark-submitted`, { method: "POST" });
+      await withTimeout(
+        api(`/sessions/${session.id}/mark-submitted`, { method: "POST" }),
+        CHECK_TIMEOUT_MS,
+        "Check timed out. Please try again."
+      );
       setSession({ ...session, status: "SUBMITTED" });
       didSubmit = true;
       if (user?.id) {
@@ -808,7 +805,7 @@ export default function Page() {
       }
     } catch (err) {
       console.error(err);
-      setError("Check failed. Backend must be running.");
+      showError("Check failed. Backend must be running.");
     } finally {
       setLoadingAction("");
       if (!didSubmit && isElectron && webviewStatus === "ready") {
@@ -820,7 +817,6 @@ export default function Page() {
   async function handleAnalyze() {
     if (!session) return;
     setLoadingAction("analyze");
-    setError("");
     setAnalyzePopup(null);
     try {
       const res = await api(`/sessions/${session.id}/analyze`, {
@@ -871,7 +867,7 @@ export default function Page() {
       });
     } catch (err) {
       console.error(err);
-      setError("Analyse failed. Backend must be running.");
+      showError("Analyse failed. Backend must be running.");
     } finally {
       setLoadingAction("");
     }
@@ -880,22 +876,21 @@ export default function Page() {
   async function handleAutofill() {
     if (!session) return;
     setLoadingAction("autofill");
-    setError("");
     try {
       const isDesktop = isElectron;
       if (isDesktop && !webviewRef.current) {
-        setError("Embedded browser is not ready yet. Try again in a moment.");
+        showError("Embedded browser is not ready yet. Try again in a moment.");
         setLoadingAction("");
         return;
       }
       if (isDesktop && webviewStatus === "failed") {
-        setError("Embedded browser failed to load. Try again or open in a browser tab.");
+        showError("Embedded browser failed to load. Try again or open in a browser tab.");
         setLoadingAction("");
         return;
       }
       const pageFields = isDesktop ? await collectWebviewFields() : [];
       if (isDesktop && pageFields.length === 0) {
-        setError("No form fields detected in the embedded browser. Try again after the form loads.");
+        showError("No form fields detected in the embedded browser. Try again after the form loads.");
         setLoadingAction("");
         return;
       }
@@ -918,7 +913,7 @@ export default function Page() {
       });
     } catch (err) {
       console.error(err);
-      setError("Autofill failed. Backend must be running.");
+      showError("Autofill failed. Backend must be running.");
     } finally {
       setLoadingAction("");
     }
@@ -1006,12 +1001,6 @@ export default function Page() {
             </div>
           </div>
         </div>
-
-        {error && (
-          <div className="rounded-xl border border-red-400/50 bg-red-500/10 px-4 py-3 text-sm text-red-100">
-            {error}
-          </div>
-        )}
 
         {user ? null : null}
 
@@ -1613,4 +1602,14 @@ function normalizeTextForMatch(text: string) {
     .replace(/[^a-z0-9]+/g, " ")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string) {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId) clearTimeout(timeoutId);
+  });
 }

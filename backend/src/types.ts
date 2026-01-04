@@ -183,3 +183,42 @@ export interface LlmSettings {
   embedModel: string;
   updatedAt: string;
 }
+
+export type CommunityThreadType = 'CHANNEL' | 'DM';
+
+export interface CommunityThread {
+  id: string;
+  threadType: CommunityThreadType;
+  name?: string | null;
+  description?: string | null;
+  createdBy?: string | null;
+  isPrivate: boolean;
+  createdAt: string;
+  lastMessageAt?: string | null;
+}
+
+export interface CommunityThreadParticipant {
+  id: string;
+  name: string;
+  email: string;
+}
+
+export interface CommunityThreadSummary {
+  id: string;
+  threadType: CommunityThreadType;
+  name?: string | null;
+  description?: string | null;
+  isPrivate: boolean;
+  createdAt: string;
+  lastMessageAt?: string | null;
+  participants?: CommunityThreadParticipant[];
+}
+
+export interface CommunityMessage {
+  id: string;
+  threadId: string;
+  senderId: string;
+  senderName?: string | null;
+  body: string;
+  createdAt: string;
+}

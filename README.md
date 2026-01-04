@@ -29,7 +29,7 @@ Electron shell (loads the frontend URL):
 ```bash
 npm --workspace electron start
 ```
-- Electron now auto-hosts the same Next.js UI when `FRONTEND_URL` is unreachable (it boots an embedded Next server on port `3300`). If both fail, it falls back to the minimal shell. Set `API_BASE` to point at your backend (default `http://localhost:4000`). `FRONTEND_URL` still overrides the frontend URL when available.
+- Electron now auto-hosts the same Next.js UI when `FRONTEND_URL` is unreachable (it boots an embedded Next server on port `3300`). If both fail, it falls back to the minimal shell. Set `API_BASE` in your env to point at your backend. `FRONTEND_URL` still overrides the frontend URL when available.
 
 Open http://localhost:3000. The app auto-logins the demo bidder `bidder@smartwork.local`.
 
@@ -49,7 +49,7 @@ Notable endpoints (MVP):
 
 ## Frontend overview (`frontend/src/app/page.tsx`)
 - Three-column work page: left stats/profile selector; middle URL + “remote browser” canvas + analyse/resume choice; right base info + autofill results + session status.
-- Uses `NEXT_PUBLIC_API_BASE` (defaults to `http://localhost:4000`).
+- Uses `NEXT_PUBLIC_API_BASE` from the frontend env file.
 - Hotkey hint shown (Ctrl+Shift+F); actual hotkey wiring ready for a future handler.
 - Remote browser area is a placeholder canvas for the Playwright stream.
 
@@ -67,5 +67,5 @@ Notable endpoints (MVP):
 - `npm --workspace frontend run lint` – lint frontend.
 
 ## Configuration
-- Frontend: set `NEXT_PUBLIC_API_BASE` if backend runs elsewhere.
+- Frontend: set `NEXT_PUBLIC_API_BASE` in `frontend/.env.local`.
 - Backend: adjust port via `PORT` env; replace seeded data in `data.ts`.

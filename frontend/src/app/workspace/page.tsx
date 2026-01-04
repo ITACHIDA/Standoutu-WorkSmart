@@ -5,7 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { useRouter } from "next/navigation";
 import TopNav from "../../components/TopNav";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:4000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
 const CONNECT_TIMEOUT_MS = 20000;
 const CHECK_TIMEOUT_MS = 10000;
 type DesktopBridge = {
@@ -316,7 +316,8 @@ export default function Page() {
     setStreamConnected(false);
     setStreamFrame("");
     setFrameLoaded(false);
-    const wsBase = API_BASE.replace(/^http/i, "ws");
+    const base = API_BASE.startsWith("http") ? API_BASE : window.location.origin;
+    const wsBase = base.replace(/^http/i, "ws");
     const ws = new WebSocket(`${wsBase}/ws/browser/${session.id}`);
     ws.onopen = () => setStreamConnected(true);
     ws.onmessage = (evt) => {

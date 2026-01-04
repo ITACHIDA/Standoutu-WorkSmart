@@ -4,6 +4,9 @@ import {
   ApplicationRecord,
   ApplicationSummary,
   Assignment,
+  CommunityMessage,
+  CommunityThread,
+  CommunityThreadSummary,
   LabelAlias,
   Profile,
   ProfileAccount,
@@ -127,6 +130,35 @@ export async function initDb() {
         UNIQUE (profile_id, email)
       );
 
+      CREATE TABLE IF NOT EXISTS community_threads (
+        id UUID PRIMARY KEY,
+        thread_type TEXT NOT NULL,
+        name TEXT,
+        name_key TEXT UNIQUE,
+        description TEXT,
+        created_by UUID REFERENCES users(id),
+        is_private BOOLEAN DEFAULT FALSE,
+        created_at TIMESTAMP DEFAULT NOW(),
+        last_message_at TIMESTAMP
+      );
+
+      CREATE TABLE IF NOT EXISTS community_thread_members (
+        id UUID PRIMARY KEY,
+        thread_id UUID REFERENCES community_threads(id) ON DELETE CASCADE,
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        role TEXT DEFAULT 'MEMBER',
+        joined_at TIMESTAMP DEFAULT NOW(),
+        UNIQUE (thread_id, user_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS community_messages (
+        id UUID PRIMARY KEY,
+        thread_id UUID REFERENCES community_threads(id) ON DELETE CASCADE,
+        sender_id UUID REFERENCES users(id),
+        body TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS seed_flags (
         key TEXT PRIMARY KEY,
         created_at TIMESTAMP DEFAULT NOW()
@@ -135,6 +167,9 @@ export async function initDb() {
       CREATE INDEX IF NOT EXISTS idx_profile_accounts_profile ON profile_accounts(profile_id);
       CREATE INDEX IF NOT EXISTS idx_applications_bidder ON applications(bidder_user_id);
       CREATE INDEX IF NOT EXISTS idx_applications_profile ON applications(profile_id);
+      CREATE INDEX IF NOT EXISTS idx_community_members_thread ON community_thread_members(thread_id);
+      CREATE INDEX IF NOT EXISTS idx_community_members_user ON community_thread_members(user_id);
+      CREATE INDEX IF NOT EXISTS idx_community_messages_thread ON community_messages(thread_id);
 
       -- Backfill schema changes at startup to avoid missing migration runs.
       ALTER TABLE IF EXISTS resumes
@@ -178,6 +213,41 @@ export async function initDb() {
         }
       }
       await client.query('INSERT INTO seed_flags (key) VALUES ($1)', [seedKey]);
+    }
+
+    const communitySeedKey = 'community_default_channels_seed';
+    const { rows: communitySeedRows } = await client.query<{ key: string }>(
+      'SELECT key FROM seed_flags WHERE key = $1',
+      [communitySeedKey],
+    );
+    if (communitySeedRows.length === 0) {
+      const defaults = [
+        {
+          name: 'general',
+          description: 'Company-wide discussions and daily updates.',
+        },
+        {
+          name: 'announcements',
+          description: 'Important notices from the team.',
+        },
+        {
+          name: 'sandbox',
+          description: 'Play area to try things out.',
+        },
+      ];
+      for (const channel of defaults) {
+        const key = channel.name.trim().toLowerCase();
+        if (!key) continue;
+        await client.query(
+          `
+            INSERT INTO community_threads (id, thread_type, name, name_key, description, created_by, is_private)
+            VALUES ($1, 'CHANNEL', $2, $3, $4, NULL, FALSE)
+            ON CONFLICT (name_key) DO NOTHING
+          `,
+          [randomUUID(), channel.name.trim(), key, channel.description ?? null],
+        );
+      }
+      await client.query('INSERT INTO seed_flags (key) VALUES ($1)', [communitySeedKey]);
     }
 
     // No seed data inserted; database starts empty.
@@ -727,4 +797,289 @@ export async function updateLabelAliasRecord(alias: LabelAlias) {
 
 export async function deleteLabelAlias(id: string) {
   await pool.query('DELETE FROM label_aliases WHERE id = $1', [id]);
+}
+
+export async function listCommunityChannels(): Promise<CommunityThread[]> {
+  const { rows } = await pool.query<CommunityThread>(
+    `
+      SELECT
+        id,
+        thread_type AS "threadType",
+        name,
+        description,
+        created_by AS "createdBy",
+        is_private AS "isPrivate",
+        created_at AS "createdAt",
+        last_message_at AS "lastMessageAt"
+      FROM community_threads
+      WHERE thread_type = 'CHANNEL'
+      ORDER BY name ASC
+    `,
+  );
+  return rows;
+}
+
+export async function listCommunityDmThreads(userId: string): Promise<CommunityThreadSummary[]> {
+  const { rows } = await pool.query<CommunityThreadSummary & { participants?: CommunityThreadSummary['participants'] }>(
+    `
+      SELECT
+        t.id,
+        t.thread_type AS "threadType",
+        t.name,
+        t.description,
+        t.is_private AS "isPrivate",
+        t.created_at AS "createdAt",
+        t.last_message_at AS "lastMessageAt",
+        COALESCE(
+          json_agg(
+            json_build_object('id', u.id, 'name', u.name, 'email', u.email)
+          ) FILTER (WHERE u.id IS NOT NULL),
+          '[]'::json
+        ) AS participants
+      FROM community_threads t
+      JOIN community_thread_members m ON m.thread_id = t.id AND m.user_id = $1
+      LEFT JOIN community_thread_members m2 ON m2.thread_id = t.id
+      LEFT JOIN users u ON u.id = m2.user_id AND u.id <> $1
+      WHERE t.thread_type = 'DM'
+      GROUP BY t.id
+      ORDER BY COALESCE(t.last_message_at, t.created_at) DESC
+    `,
+    [userId],
+  );
+  return rows.map((row) => ({
+    ...row,
+    participants: row.participants ?? [],
+  }));
+}
+
+export async function findCommunityChannelByKey(nameKey: string): Promise<CommunityThread | undefined> {
+  const { rows } = await pool.query<CommunityThread>(
+    `
+      SELECT
+        id,
+        thread_type AS "threadType",
+        name,
+        description,
+        created_by AS "createdBy",
+        is_private AS "isPrivate",
+        created_at AS "createdAt",
+        last_message_at AS "lastMessageAt"
+      FROM community_threads
+      WHERE thread_type = 'CHANNEL' AND name_key = $1
+      LIMIT 1
+    `,
+    [nameKey],
+  );
+  return rows[0];
+}
+
+export async function findCommunityThreadById(id: string): Promise<CommunityThread | undefined> {
+  const { rows } = await pool.query<CommunityThread>(
+    `
+      SELECT
+        id,
+        thread_type AS "threadType",
+        name,
+        description,
+        created_by AS "createdBy",
+        is_private AS "isPrivate",
+        created_at AS "createdAt",
+        last_message_at AS "lastMessageAt"
+      FROM community_threads
+      WHERE id = $1
+      LIMIT 1
+    `,
+    [id],
+  );
+  return rows[0];
+}
+
+export async function isCommunityThreadMember(threadId: string, userId: string): Promise<boolean> {
+  const { rows } = await pool.query<{ ok: number }>(
+    `
+      SELECT 1 as ok
+      FROM community_thread_members
+      WHERE thread_id = $1 AND user_id = $2
+      LIMIT 1
+    `,
+    [threadId, userId],
+  );
+  return rows.length > 0;
+}
+
+export async function insertCommunityThread(thread: {
+  id: string;
+  threadType: CommunityThread['threadType'];
+  name?: string | null;
+  nameKey?: string | null;
+  description?: string | null;
+  createdBy?: string | null;
+  isPrivate?: boolean;
+  createdAt?: string;
+}): Promise<CommunityThread> {
+  const createdAt = thread.createdAt ?? new Date().toISOString();
+  const { rows } = await pool.query<CommunityThread>(
+    `
+      INSERT INTO community_threads (
+        id,
+        thread_type,
+        name,
+        name_key,
+        description,
+        created_by,
+        is_private,
+        created_at,
+        last_message_at
+      )
+      VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NULL)
+      RETURNING
+        id,
+        thread_type AS "threadType",
+        name,
+        description,
+        created_by AS "createdBy",
+        is_private AS "isPrivate",
+        created_at AS "createdAt",
+        last_message_at AS "lastMessageAt"
+    `,
+    [
+      thread.id,
+      thread.threadType,
+      thread.name ?? null,
+      thread.nameKey ?? null,
+      thread.description ?? null,
+      thread.createdBy ?? null,
+      thread.isPrivate ?? false,
+      createdAt,
+    ],
+  );
+  return rows[0];
+}
+
+export async function insertCommunityThreadMember(member: {
+  id: string;
+  threadId: string;
+  userId: string;
+  role?: string;
+  joinedAt?: string;
+}) {
+  await pool.query(
+    `
+      INSERT INTO community_thread_members (id, thread_id, user_id, role, joined_at)
+      VALUES ($1, $2, $3, $4, COALESCE($5, NOW()))
+      ON CONFLICT (thread_id, user_id) DO NOTHING
+    `,
+    [member.id, member.threadId, member.userId, member.role ?? 'MEMBER', member.joinedAt ?? null],
+  );
+}
+
+export async function findCommunityDmThreadId(userId: string, otherUserId: string): Promise<string | undefined> {
+  const { rows } = await pool.query<{ id: string }>(
+    `
+      SELECT t.id
+      FROM community_threads t
+      JOIN community_thread_members m1 ON m1.thread_id = t.id AND m1.user_id = $1
+      JOIN community_thread_members m2 ON m2.thread_id = t.id AND m2.user_id = $2
+      WHERE t.thread_type = 'DM'
+      LIMIT 1
+    `,
+    [userId, otherUserId],
+  );
+  return rows[0]?.id;
+}
+
+export async function getCommunityDmThreadSummary(
+  threadId: string,
+  userId: string,
+): Promise<CommunityThreadSummary | undefined> {
+  const { rows } = await pool.query<CommunityThreadSummary & { participants?: CommunityThreadSummary['participants'] }>(
+    `
+      SELECT
+        t.id,
+        t.thread_type AS "threadType",
+        t.name,
+        t.description,
+        t.is_private AS "isPrivate",
+        t.created_at AS "createdAt",
+        t.last_message_at AS "lastMessageAt",
+        COALESCE(
+          json_agg(
+            json_build_object('id', u.id, 'name', u.name, 'email', u.email)
+          ) FILTER (WHERE u.id IS NOT NULL),
+          '[]'::json
+        ) AS participants
+      FROM community_threads t
+      JOIN community_thread_members m ON m.thread_id = t.id AND m.user_id = $1
+      LEFT JOIN community_thread_members m2 ON m2.thread_id = t.id
+      LEFT JOIN users u ON u.id = m2.user_id AND u.id <> $1
+      WHERE t.thread_type = 'DM' AND t.id = $2
+      GROUP BY t.id
+      LIMIT 1
+    `,
+    [userId, threadId],
+  );
+  const row = rows[0];
+  if (!row) return undefined;
+  return { ...row, participants: row.participants ?? [] };
+}
+
+export async function listCommunityMessages(threadId: string): Promise<CommunityMessage[]> {
+  const { rows } = await pool.query<CommunityMessage>(
+    `
+      SELECT
+        m.id,
+        m.thread_id AS "threadId",
+        m.sender_id AS "senderId",
+        u.name AS "senderName",
+        m.body,
+        m.created_at AS "createdAt"
+      FROM community_messages m
+      LEFT JOIN users u ON u.id = m.sender_id
+      WHERE m.thread_id = $1
+      ORDER BY m.created_at ASC
+      LIMIT 200
+    `,
+    [threadId],
+  );
+  return rows;
+}
+
+export async function listCommunityThreadMemberIds(threadId: string): Promise<string[]> {
+  const { rows } = await pool.query<{ userId: string }>(
+    `
+      SELECT user_id AS "userId"
+      FROM community_thread_members
+      WHERE thread_id = $1
+    `,
+    [threadId],
+  );
+  return rows.map((row) => row.userId);
+}
+
+export async function insertCommunityMessage(message: CommunityMessage): Promise<CommunityMessage> {
+  const createdAt = message.createdAt ?? new Date().toISOString();
+  const { rows } = await pool.query<CommunityMessage>(
+    `
+      WITH inserted AS (
+        INSERT INTO community_messages (id, thread_id, sender_id, body, created_at)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, thread_id, sender_id, body, created_at
+      )
+      SELECT
+        inserted.id,
+        inserted.thread_id AS "threadId",
+        inserted.sender_id AS "senderId",
+        u.name AS "senderName",
+        inserted.body,
+        inserted.created_at AS "createdAt"
+      FROM inserted
+      LEFT JOIN users u ON u.id = inserted.sender_id
+    `,
+    [message.id, message.threadId, message.senderId, message.body, createdAt],
+  );
+  await pool.query('UPDATE community_threads SET last_message_at = $2 WHERE id = $1', [
+    message.threadId,
+    createdAt,
+  ]);
+  return rows[0];
 }

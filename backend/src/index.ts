@@ -6,6 +6,7 @@ import { randomUUID } from 'crypto';
 import { promises as fs } from 'fs';
 import path from 'path';
 import fsSync from 'fs';
+import type { WebSocket } from 'ws';
 import { z } from 'zod';
 import { chromium, Browser, Page, Frame } from 'playwright';
 import bcrypt from 'bcryptjs';
@@ -17,15 +18,19 @@ import {
   ApplicationSession,
   Assignment,
   BaseInfo,
+  CommunityMessage,
   LabelAlias,
   Resume,
   SessionStatus,
   User,
   UserRole,
 } from './types';
-import { authGuard, forbidObserver, signToken } from './auth';
+import { authGuard, forbidObserver, signToken, verifyToken } from './auth';
 import {
   closeAssignmentById,
+  findCommunityChannelByKey,
+  findCommunityDmThreadId,
+  findCommunityThreadById,
   deleteResumeById,
   findActiveAssignmentByProfile,
   deleteLabelAlias,
@@ -49,11 +54,20 @@ import {
   listApplications,
   listAssignments,
   listBidderSummaries,
+  listCommunityChannels,
+  listCommunityDmThreads,
+  listCommunityMessages,
+  listCommunityThreadMemberIds,
   listLabelAliases,
   listProfiles,
   listProfilesForBidder,
   listResumesByProfile,
   pool,
+  getCommunityDmThreadSummary,
+  insertCommunityMessage,
+  insertCommunityThread,
+  insertCommunityThreadMember,
+  isCommunityThreadMember,
   updateProfileRecord,
   updateLabelAliasRecord,
 } from './db';
@@ -80,6 +94,9 @@ const livePages = new Map<
   string,
   { browser: Browser; page: Page; interval?: NodeJS.Timeout }
 >();
+
+type CommunityWsClient = { socket: WebSocket; user: User };
+const communityClients = new Set<CommunityWsClient>();
 
 type FillPlanResult = {
   filled?: { field: string; value: string; confidence?: number }[];
@@ -110,6 +127,68 @@ function formatPhone(contact?: BaseInfo['contact']) {
   const combined = parts.join(' ').trim();
   const fallback = trimString(contact.phone);
   return combined || fallback;
+}
+
+function normalizeChannelName(input: string) {
+  return input.replace(/^#+/, '').trim();
+}
+
+function readWsToken(req: any) {
+  const header = req.headers?.authorization;
+  if (typeof header === 'string' && header.startsWith('Bearer ')) {
+    return header.slice('Bearer '.length);
+  }
+  const query = req.query as { token?: string } | undefined;
+  if (query?.token && typeof query.token === 'string') {
+    return query.token;
+  }
+  const rawUrl = req.raw?.url;
+  if (typeof rawUrl === 'string' && rawUrl.includes('?')) {
+    const qs = rawUrl.split('?')[1] ?? '';
+    const params = new URLSearchParams(qs);
+    const token = params.get('token');
+    if (token) return token;
+  }
+  return undefined;
+}
+
+function sendCommunityPayload(client: CommunityWsClient, payload: Record<string, unknown>) {
+  try {
+    const socket = client.socket;
+    if (typeof socket.send !== 'function') return;
+    if (typeof socket.readyState === 'number' && socket.readyState !== 1) return;
+    socket.send(JSON.stringify(payload));
+  } catch {
+    // ignore websocket send errors
+  }
+}
+
+async function broadcastCommunityMessage(threadId: string, message: CommunityMessage) {
+  const thread = await findCommunityThreadById(threadId);
+  if (!thread) return;
+  const payload = {
+    type: 'community_message',
+    threadId,
+    threadType: thread.threadType,
+    message,
+  };
+  if (thread.threadType === 'CHANNEL' && !thread.isPrivate) {
+    app.log.info({ threadId, clients: communityClients.size }, 'community broadcast channel');
+    communityClients.forEach((client) => sendCommunityPayload(client, payload));
+    return;
+  }
+  const memberIds = await listCommunityThreadMemberIds(threadId);
+  if (!memberIds.length) return;
+  const allowed = new Set(memberIds);
+  app.log.info(
+    { threadId, recipients: allowed.size, clients: communityClients.size },
+    'community broadcast dm',
+  );
+  communityClients.forEach((client) => {
+    if (allowed.has(client.user.id)) {
+      sendCommunityPayload(client, payload);
+    }
+  });
 }
 
 function mergeBaseInfo(existing?: BaseInfo, incoming?: Partial<BaseInfo>): BaseInfo {
@@ -1502,6 +1581,169 @@ async function bootstrap() {
     return assignment;
   });
 
+  const ensureCommunityThreadAccess = async (threadId: string, actor: User, reply: any) => {
+    const thread = await findCommunityThreadById(threadId);
+    if (!thread) {
+      reply.status(404).send({ message: 'Thread not found' });
+      return undefined;
+    }
+    if (thread.threadType === 'DM' || thread.isPrivate) {
+      const isMember = await isCommunityThreadMember(threadId, actor.id);
+      if (!isMember) {
+        reply.status(403).send({ message: 'Not a member of this thread' });
+        return undefined;
+      }
+    }
+    return thread;
+  };
+
+  app.get('/community/overview', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: 'Unauthorized' });
+    const [channels, dms] = await Promise.all([
+      listCommunityChannels(),
+      listCommunityDmThreads(actor.id),
+    ]);
+    return { channels, dms };
+  });
+
+  app.post('/community/channels', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: 'Unauthorized' });
+    const schema = z.object({
+      name: z.string(),
+      description: z.string().optional(),
+    });
+    const body = schema.parse(request.body);
+    const name = normalizeChannelName(body.name);
+    if (!name) return reply.status(400).send({ message: 'Channel name required' });
+    const nameKey = name.toLowerCase();
+    const existing = await findCommunityChannelByKey(nameKey);
+    if (existing) {
+      return reply.status(409).send({ message: 'Channel already exists', channel: existing });
+    }
+    const created = await insertCommunityThread({
+      id: randomUUID(),
+      threadType: 'CHANNEL',
+      name,
+      nameKey,
+      description: body.description?.trim() || null,
+      createdBy: actor.id,
+      isPrivate: false,
+    });
+    await insertCommunityThreadMember({
+      id: randomUUID(),
+      threadId: created.id,
+      userId: actor.id,
+      role: 'OWNER',
+    });
+    return created;
+  });
+
+  app.post('/community/dms', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: 'Unauthorized' });
+    const schema = z.object({ userId: z.string() });
+    const body = schema.parse(request.body);
+    if (body.userId === actor.id) {
+      return reply.status(400).send({ message: 'Cannot start a DM with yourself' });
+    }
+    const other = await findUserById(body.userId);
+    if (!other || other.isActive === false) {
+      return reply.status(404).send({ message: 'User not found' });
+    }
+    const existingId = await findCommunityDmThreadId(actor.id, body.userId);
+    if (existingId) {
+      const summary = await getCommunityDmThreadSummary(existingId, actor.id);
+      if (summary) return summary;
+      return {
+        id: existingId,
+        threadType: 'DM',
+        isPrivate: true,
+        createdAt: new Date().toISOString(),
+        participants: [{ id: other.id, name: other.name, email: other.email }],
+      };
+    }
+    const thread = await insertCommunityThread({
+      id: randomUUID(),
+      threadType: 'DM',
+      name: null,
+      nameKey: null,
+      description: null,
+      createdBy: actor.id,
+      isPrivate: true,
+    });
+    await insertCommunityThreadMember({
+      id: randomUUID(),
+      threadId: thread.id,
+      userId: actor.id,
+      role: 'MEMBER',
+    });
+    await insertCommunityThreadMember({
+      id: randomUUID(),
+      threadId: thread.id,
+      userId: other.id,
+      role: 'MEMBER',
+    });
+    const summary = await getCommunityDmThreadSummary(thread.id, actor.id);
+    return (
+      summary ?? {
+        id: thread.id,
+        threadType: 'DM',
+        isPrivate: true,
+        createdAt: thread.createdAt,
+        participants: [{ id: other.id, name: other.name, email: other.email }],
+      }
+    );
+  });
+
+  app.get('/community/threads/:id/messages', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: 'Unauthorized' });
+    const { id } = request.params as { id: string };
+    const thread = await ensureCommunityThreadAccess(id, actor, reply);
+    if (!thread) return;
+    return listCommunityMessages(id);
+  });
+
+  app.post('/community/threads/:id/messages', async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: 'Unauthorized' });
+    const { id } = request.params as { id: string };
+    const schema = z.object({ body: z.string() });
+    const body = schema.parse(request.body);
+    const text = body.body.trim();
+    if (!text) return reply.status(400).send({ message: 'Message body required' });
+    const thread = await ensureCommunityThreadAccess(id, actor, reply);
+    if (!thread) return;
+    if (thread.threadType === 'CHANNEL') {
+      await insertCommunityThreadMember({
+        id: randomUUID(),
+        threadId: id,
+        userId: actor.id,
+        role: 'MEMBER',
+      });
+    }
+    const message = await insertCommunityMessage({
+      id: randomUUID(),
+      threadId: id,
+      senderId: actor.id,
+      body: text,
+      createdAt: new Date().toISOString(),
+    });
+    try {
+      await broadcastCommunityMessage(id, message);
+    } catch (err) {
+      request.log.error({ err }, 'community realtime broadcast failed');
+    }
+    return message;
+  });
+
   app.get('/sessions/:id', async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
@@ -2083,16 +2325,42 @@ async function bootstrap() {
     app.log.info(`API running on http://localhost:${PORT}`);
   });
 
-  app.get('/ws/browser/:sessionId', { websocket: true }, async (connection, req) => {
-    // Allow ws without auth for now to keep demo functional
-    if (!connection || !connection.socket) {
+  app.get('/ws/community', { websocket: true }, async (socket, req) => {
+    const token = readWsToken(req);
+    if (!token) {
+      socket.close();
       return;
     }
+    let user: User | undefined;
+    try {
+      const decoded = verifyToken(token);
+      user = await findUserById(decoded.sub);
+    } catch {
+      socket.close();
+      return;
+    }
+    if (!user || user.isActive === false || user.role === 'OBSERVER') {
+      socket.close();
+      return;
+    }
+    const client: CommunityWsClient = { socket, user };
+    communityClients.add(client);
+    app.log.info({ userId: user.id }, 'community ws connected');
+    sendCommunityPayload(client, { type: 'community_ready' });
+
+    socket.on('close', () => {
+      communityClients.delete(client);
+      app.log.info({ userId: user.id }, 'community ws disconnected');
+    });
+  });
+
+  app.get('/ws/browser/:sessionId', { websocket: true }, async (socket, req) => {
+    // Allow ws without auth for now to keep demo functional
     const { sessionId } = req.params as { sessionId: string };
     const live = livePages.get(sessionId);
     if (!live) {
-      connection.socket?.send(JSON.stringify({ type: 'error', message: 'No live browser' }));
-      connection.socket?.close();
+      socket.send(JSON.stringify({ type: 'error', message: 'No live browser' }));
+      socket.close();
       return;
     }
 
@@ -2100,9 +2368,9 @@ async function bootstrap() {
     const sendFrame = async () => {
       try {
         const buf = await page.screenshot({ fullPage: true });
-        connection.socket?.send(JSON.stringify({ type: 'frame', data: buf.toString('base64') }));
+        socket.send(JSON.stringify({ type: 'frame', data: buf.toString('base64') }));
       } catch (err) {
-        connection.socket?.send(JSON.stringify({ type: 'error', message: 'Could not capture frame' }));
+        socket.send(JSON.stringify({ type: 'error', message: 'Could not capture frame' }));
       }
     };
 
@@ -2110,7 +2378,7 @@ async function bootstrap() {
     const interval = setInterval(sendFrame, 1000);
     livePages.set(sessionId, { ...live, interval });
 
-    connection.socket.on('close', () => {
+    socket.on('close', () => {
       clearInterval(interval);
       const current = livePages.get(sessionId);
       if (current) {

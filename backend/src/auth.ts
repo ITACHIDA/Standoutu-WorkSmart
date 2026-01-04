@@ -11,6 +11,10 @@ export function signToken(user: User) {
   return jwt.sign(payload, JWT_SECRET, { expiresIn: '8h' });
 }
 
+export function verifyToken(token: string) {
+  return jwt.verify(token, JWT_SECRET) as { sub: string };
+}
+
 declare module 'fastify' {
   interface FastifyRequest {
     authUser?: User;
@@ -24,12 +28,13 @@ export const authGuard = fastifyPlugin(async (instance) => {
       routeUrl === '/health' ||
       routeUrl === '/auth/login' ||
       routeUrl === '/auth/signup' ||
-      (routeUrl && routeUrl.startsWith('/ws/browser'))
+      (routeUrl && routeUrl.startsWith('/ws/browser')) ||
+      (routeUrl && routeUrl.startsWith('/ws/community'))
     ) {
       return;
     }
     // Also allow websocket upgrade paths detected via raw url.
-    if (request.raw?.url?.startsWith('/ws/browser')) {
+    if (request.raw?.url?.startsWith('/ws/browser') || request.raw?.url?.startsWith('/ws/community')) {
       return;
     }
     const header = request.headers.authorization;

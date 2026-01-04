@@ -1,6 +1,6 @@
 import { readAuth } from './auth';
 
-export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? 'http://localhost:4000';
+export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
 
 export async function api<T = unknown>(
   path: string,

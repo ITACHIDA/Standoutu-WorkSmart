@@ -106,7 +106,7 @@ import {
 import { loadOutlookEvents } from "./msGraph";
 
 const PORT = config.PORT;
-const app = fastify({ logger: true });
+const app = fastify({ logger: config.DEBUG_MODE });
 const PROJECT_ROOT = path.join(__dirname, "..");
 const RESUME_DIR = config.RESUME_DIR || path.join(PROJECT_ROOT, "data", "resumes");
 const HF_TOKEN = config.HF_TOKEN;
@@ -3115,6 +3115,7 @@ async function bootstrap() {
       };
     } catch (err) {
       request.log.error({ err }, "File upload failed");
+      console.log(err)
       return reply.status(500).send({ message: "Upload failed" });
     }
   });

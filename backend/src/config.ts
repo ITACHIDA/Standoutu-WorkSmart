@@ -4,6 +4,8 @@ export const config = {
   PORT: process.env.PORT ? Number(process.env.PORT) : 4000,
   
   DATABASE_URL: process.env.DATABASE_URL || 'postgres://postgres:postgres@localhost:5432/ops_db',
+
+  DEBUG_MODE: false,
   
   CORS_ORIGINS: [
     'http://localhost:3000',

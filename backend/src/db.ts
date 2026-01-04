@@ -235,6 +235,20 @@ export async function initDb() {
         updated_at TIMESTAMP DEFAULT NOW()
       );
 
+      -- Backfill new community message columns before creating indexes.
+      ALTER TABLE IF EXISTS community_messages
+        ADD COLUMN IF NOT EXISTS reply_to_message_id UUID REFERENCES community_messages(id);
+      ALTER TABLE IF EXISTS community_messages
+        ADD COLUMN IF NOT EXISTS is_edited BOOLEAN DEFAULT FALSE;
+      ALTER TABLE IF EXISTS community_messages
+        ADD COLUMN IF NOT EXISTS edited_at TIMESTAMP;
+      ALTER TABLE IF EXISTS community_messages
+        ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE;
+      ALTER TABLE IF EXISTS community_messages
+        ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMP;
+      ALTER TABLE IF EXISTS community_messages
+        ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT NOW();
+
       CREATE INDEX IF NOT EXISTS idx_profile_accounts_profile ON profile_accounts(profile_id);
       CREATE INDEX IF NOT EXISTS idx_applications_bidder ON applications(bidder_user_id);
       CREATE INDEX IF NOT EXISTS idx_applications_profile ON applications(profile_id);

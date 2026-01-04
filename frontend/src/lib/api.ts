@@ -1,6 +1,26 @@
 import { readAuth } from './auth';
 
-export const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? '';
+const LOCAL_API_PORT = 4000;
+
+function resolveApiBase(): string {
+  const envBase = (process.env.NEXT_PUBLIC_API_BASE || '').trim();
+  if (envBase) return envBase.replace(/\/$/, '');
+  if (typeof window === 'undefined') return '';
+  const { protocol, hostname } = window.location;
+  if (hostname === 'localhost' || hostname === '127.0.0.1') {
+    return `${protocol}//${hostname}:${LOCAL_API_PORT}`;
+  }
+  return window.location.origin;
+}
+
+export const API_BASE = resolveApiBase();
+
+function buildApiUrl(path: string): string {
+  if (/^https?:\/\//i.test(path)) return path;
+  const base = API_BASE || (typeof window !== 'undefined' ? window.location.origin : '');
+  if (!base) return path;
+  return new URL(path, base).toString();
+}
 
 export async function api<T = unknown>(
   path: string,
@@ -21,11 +41,18 @@ export async function api<T = unknown>(
     mergedHeaders['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...init,
-    headers: mergedHeaders,
-    cache: 'no-store',
-  });
+  const url = buildApiUrl(path);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      ...init,
+      headers: mergedHeaders,
+      cache: 'no-store',
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    throw new Error(`Network error contacting API (${url}): ${message}`);
+  }
 
   if (!res.ok) {
     if (res.status === 401) {

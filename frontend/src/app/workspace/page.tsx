@@ -180,9 +180,11 @@ export default function Page() {
   const [streamConnected, setStreamConnected] = useState(false);
   const [analyzePopup, setAnalyzePopup] = useState<AnalyzePopupState | null>(null);
   const [useAiAnalyze, setUseAiAnalyze] = useState(false);
+  const [applicationPhrases, setApplicationPhrases] = useState<string[]>([]);
   const [showBaseInfo, setShowBaseInfo] = useState(false);
   const [baseInfoView, setBaseInfoView] = useState<BaseInfo>(() => cleanBaseInfo({}));
   const [webviewStatus, setWebviewStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle");
+  const [checkEnabled, setCheckEnabled] = useState(false);
   const webviewRef = useRef<WebviewHandle | null>(null);
   const [isClient, setIsClient] = useState(false);
   const router = useRouter();
@@ -1125,13 +1127,12 @@ export default function Page() {
                 ) : browserSrc ? (
                   isElectron ? (
                     <div className="relative h-full w-full">
-                      {/* @ts-expect-error Electron webview not in TS DOM lib */}
                       <webview
                         ref={webviewRef as unknown as React.Ref<HTMLWebViewElement>}
                         key={browserSrc}
                         src={browserSrc}
                         partition={webviewPartition}
-                        allowpopups="true"
+                        allowpopups={true}
                         style={{ height: "100%", width: "100%", backgroundColor: "#020617" }}
                       />
                       <div className="absolute top-2 right-3 flex items-center gap-2 text-[11px] text-slate-800">

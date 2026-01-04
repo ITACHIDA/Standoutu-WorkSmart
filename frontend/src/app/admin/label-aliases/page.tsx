@@ -23,6 +23,8 @@ type TagRow = {
   id?: string;
 };
 
+const APPLICATION_SUCCESS_KEY = 'application_success';
+
 const getErrorMessage = (err: unknown, fallback: string) => {
   if (err instanceof Error && err.message) return err.message;
   return fallback;

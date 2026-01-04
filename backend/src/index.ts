@@ -1,30 +1,55 @@
-import 'dotenv/config';
-import fastify from 'fastify';
-import cors from '@fastify/cors';
-import websocket from '@fastify/websocket';
-import { randomUUID } from 'crypto';
-import { promises as fs } from 'fs';
-import path from 'path';
-import fsSync from 'fs';
-import { z } from 'zod';
-import { chromium, Browser, Page, Frame } from 'playwright';
-import bcrypt from 'bcryptjs';
-import pdfParse from 'pdf-parse';
-import { extractRawText } from 'mammoth';
-import { events, llmSettings, sessions } from './data';
-import { ApplicationSession, Assignment, BaseInfo, LabelAlias, Resume, SessionStatus, User, UserRole } from './types';
-import { authGuard, forbidObserver, signToken } from './auth';
+import "dotenv/config";
+import fastify from "fastify";
+import cors from "@fastify/cors";
+import websocket from "@fastify/websocket";
+import multipart from "@fastify/multipart";
+import { randomUUID } from "crypto";
+import { promises as fs } from "fs";
+import path from "path";
+import fsSync from "fs";
+import type { WebSocket } from "ws";
+import { z } from "zod";
+import { chromium, Browser, Page, Frame } from "playwright";
+import bcrypt from "bcryptjs";
+import pdfParse from "pdf-parse";
+import { extractRawText } from "mammoth";
+import { config } from "./config";
+import { events, llmSettings, sessions } from "./data";
 import {
+  ApplicationRecord,
+  ApplicationSession,
+  Assignment,
+  BaseInfo,
+  CommunityMessage,
+  LabelAlias,
+  Resume,
+  SessionStatus,
+  User,
+  UserRole,
+} from "./types";
+import { authGuard, forbidObserver, signToken, verifyToken } from "./auth";
+import { uploadFile as uploadToSupabase } from "./supabaseStorage";
+import {
+  addMessageReaction,
   closeAssignmentById,
-  deleteResumeById,
-  findActiveAssignmentByProfile,
+  deleteMessage,
   deleteLabelAlias,
+  deleteResumeById,
+  editMessage,
+  findActiveAssignmentByProfile,
+  findCommunityChannelByKey,
+  findCommunityDmThreadId,
+  findCommunityThreadById,
   findLabelAliasById,
   findLabelAliasByNormalized,
+  findProfileAccountById,
   findProfileById,
   findResumeById,
   findUserByEmail,
   findUserById,
+  getCommunityDmThreadSummary,
+  getMessageById,
+  incrementUnreadCount,
   initDb,
   insertProfile,
   findProfileAccountById,
@@ -35,56 +60,182 @@ import {
   listCalendarEventsForOwner,
   insertLabelAlias,
   insertAssignmentRecord,
+  insertCommunityMessage,
+  insertCommunityThread,
+  insertCommunityThreadMember,
+  insertLabelAlias,
+  insertMessageAttachment,
+  insertProfile,
   insertResumeRecord,
   insertUser,
+  isCommunityThreadMember,
+  listApplications,
   listAssignments,
   listBidderSummaries,
+  listCommunityChannels,
+  listCommunityDmThreads,
+  listCommunityMessages,
+  listCommunityMessagesWithPagination,
+  listCommunityThreadMemberIds,
   listLabelAliases,
+  listMessageAttachments,
+  listMessageReactions,
+  listPinnedMessages,
+  listProfileAccountsForUser,
   listProfiles,
   listProfilesForBidder,
   listResumesByProfile,
+  listUserPresences,
+  markThreadAsRead,
+  pinMessage,
   pool,
-  updateProfileRecord,
+  removeMessageReaction,
+  touchProfileAccount,
+  unpinMessage,
   updateLabelAliasRecord,
-} from './db';
-import { CANONICAL_LABEL_KEYS, DEFAULT_LABEL_ALIASES, buildAliasIndex, matchLabelToCanonical, normalizeLabelAlias } from './labelAliases';
-import { analyzeJobFromHtml, callPromptPack, promptBuilders } from './resumeClassifier';
-import { loadOutlookEvents } from './msGraph';
+  updateProfileRecord,
+  updateUserPresence,
+  upsertProfileAccount,
+} from "./db";
+import {
+  CANONICAL_LABEL_KEYS,
+  DEFAULT_LABEL_ALIASES,
+  buildAliasIndex,
+  buildApplicationSuccessPhrases,
+  matchLabelToCanonical,
+  normalizeLabelAlias,
+} from "./labelAliases";
+import {
+  analyzeJobFromHtml,
+  callPromptPack,
+  promptBuilders,
+} from "./resumeClassifier";
+import { loadOutlookEvents } from "./msGraph";
 
-const PORT = process.env.PORT ? Number(process.env.PORT) : 4000;
-const app = fastify({ logger: true });
-const PROJECT_ROOT = path.join(__dirname, '..');
-const RESUME_DIR = process.env.RESUME_DIR ?? path.join(PROJECT_ROOT, 'data', 'resumes');
-const HF_TOKEN =
-  process.env.HF_TOKEN || process.env.HUGGINGFACEHUB_API_TOKEN || process.env.HUGGING_FACE_TOKEN || '';
-const HF_MODEL = process.env.HF_MODEL || 'meta-llama/Meta-Llama-3-8B-Instruct';
+const PORT = config.PORT;
+const app = fastify({ logger: config.DEBUG_MODE });
+const PROJECT_ROOT = path.join(__dirname, "..");
+const RESUME_DIR = config.RESUME_DIR || path.join(PROJECT_ROOT, "data", "resumes");
+const HF_TOKEN = config.HF_TOKEN;
+const HF_MODEL = config.HF_MODEL;
 
 const livePages = new Map<
   string,
   { browser: Browser; page: Page; interval?: NodeJS.Timeout }
 >();
 
+type CommunityWsClient = { socket: WebSocket; user: User };
+const communityClients = new Set<CommunityWsClient>();
+
 type FillPlanResult = {
   filled?: { field: string; value: string; confidence?: number }[];
   suggestions?: { field: string; suggestion: string }[];
   blocked?: string[];
+  actions?: FillPlanAction[];
+};
+
+type FillPlanAction = {
+  field: string;
+  field_id?: string;
+  label?: string;
+  selector?: string;
+  action: "fill" | "select" | "check" | "uncheck" | "click" | "upload" | "skip";
+  value?: string;
+  confidence?: number;
 };
 
 function trimString(val: unknown): string {
-  if (typeof val === 'string') return val.trim();
-  if (typeof val === 'number') return String(val);
-  return '';
+  if (typeof val === "string") return val.trim();
+  if (typeof val === "number") return String(val);
+  return "";
 }
 
-function formatPhone(contact?: BaseInfo['contact']) {
-  if (!contact) return '';
-  const parts = [contact.phoneCode, contact.phoneNumber].map(trimString).filter(Boolean);
-  const combined = parts.join(' ').trim();
+function formatPhone(contact?: BaseInfo["contact"]) {
+  if (!contact) return "";
+  const parts = [contact.phoneCode, contact.phoneNumber]
+    .map(trimString)
+    .filter(Boolean);
+  const combined = parts.join(" ").trim();
   const fallback = trimString(contact.phone);
   return combined || fallback;
 }
 
-function mergeBaseInfo(existing?: BaseInfo, incoming?: Partial<BaseInfo>): BaseInfo {
+function normalizeChannelName(input: string) {
+  return input.replace(/^#+/, "").trim();
+}
+
+function readWsToken(req: any) {
+  const header = req.headers?.authorization;
+  if (typeof header === "string" && header.startsWith("Bearer ")) {
+    return header.slice("Bearer ".length);
+  }
+  const query = req.query as { token?: string } | undefined;
+  if (query?.token && typeof query.token === "string") {
+    return query.token;
+  }
+  const rawUrl = req.raw?.url;
+  if (typeof rawUrl === "string" && rawUrl.includes("?")) {
+    const qs = rawUrl.split("?")[1] ?? "";
+    const params = new URLSearchParams(qs);
+    const token = params.get("token");
+    if (token) return token;
+  }
+  return undefined;
+}
+
+function sendCommunityPayload(
+  client: CommunityWsClient,
+  payload: Record<string, unknown>
+) {
+  try {
+    const socket = client.socket;
+    if (typeof socket.send !== "function") return;
+    if (typeof socket.readyState === "number" && socket.readyState !== 1)
+      return;
+    socket.send(JSON.stringify(payload));
+  } catch {
+    // ignore websocket send errors
+  }
+}
+
+async function broadcastCommunityMessage(
+  threadId: string,
+  message: CommunityMessage
+) {
+  const thread = await findCommunityThreadById(threadId);
+  if (!thread) return;
+  const payload = {
+    type: "community_message",
+    threadId,
+    threadType: thread.threadType,
+    message,
+  };
+  if (thread.threadType === "CHANNEL" && !thread.isPrivate) {
+    app.log.info(
+      { threadId, clients: communityClients.size },
+      "community broadcast channel"
+    );
+    communityClients.forEach((client) => sendCommunityPayload(client, payload));
+    return;
+  }
+  const memberIds = await listCommunityThreadMemberIds(threadId);
+  if (!memberIds.length) return;
+  const allowed = new Set(memberIds);
+  app.log.info(
+    { threadId, recipients: allowed.size, clients: communityClients.size },
+    "community broadcast dm"
+  );
+  communityClients.forEach((client) => {
+    if (allowed.has(client.user.id)) {
+      sendCommunityPayload(client, payload);
+    }
+  });
+}
+
+function mergeBaseInfo(
+  existing?: BaseInfo,
+  incoming?: Partial<BaseInfo>
+): BaseInfo {
   const current = existing ?? {};
   const next = incoming ?? {};
   const merged: BaseInfo = {
@@ -97,8 +248,14 @@ function mergeBaseInfo(existing?: BaseInfo, incoming?: Partial<BaseInfo>): BaseI
     links: { ...(current.links ?? {}), ...(next.links ?? {}) },
     career: { ...(current.career ?? {}), ...(next.career ?? {}) },
     education: { ...(current.education ?? {}), ...(next.education ?? {}) },
-    preferences: { ...(current.preferences ?? {}), ...(next.preferences ?? {}) },
-    defaultAnswers: { ...(current.defaultAnswers ?? {}), ...(next.defaultAnswers ?? {}) },
+    preferences: {
+      ...(current.preferences ?? {}),
+      ...(next.preferences ?? {}),
+    },
+    defaultAnswers: {
+      ...(current.defaultAnswers ?? {}),
+      ...(next.defaultAnswers ?? {}),
+    },
   };
   const phone = formatPhone(merged.contact);
   if (phone) {
@@ -108,9 +265,9 @@ function mergeBaseInfo(existing?: BaseInfo, incoming?: Partial<BaseInfo>): BaseI
 }
 
 function parseSalaryNumber(input?: string | number | null) {
-  if (typeof input === 'number' && Number.isFinite(input)) return input;
-  if (typeof input !== 'string') return undefined;
-  const cleaned = input.replace(/[, ]+/g, '').replace(/[^0-9.]/g, '');
+  if (typeof input === "number" && Number.isFinite(input)) return input;
+  if (typeof input !== "string") return undefined;
+  const cleaned = input.replace(/[, ]+/g, "").replace(/[^0-9.]/g, "");
   if (!cleaned) return undefined;
   const parsed = Number(cleaned);
   return Number.isFinite(parsed) ? parsed : undefined;
@@ -124,42 +281,51 @@ function computeHourlyRate(desiredSalary?: string | number | null) {
 
 function buildAutofillValueMap(
   baseInfo: BaseInfo,
-  jobContext?: Record<string, unknown>,
-  parsedResume?: any,
+  jobContext?: Record<string, unknown>
 ): Record<string, string> {
   const firstName = trimString(baseInfo?.name?.first);
   const lastName = trimString(baseInfo?.name?.last);
-  const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+  const fullName = [firstName, lastName].filter(Boolean).join(" ").trim();
   const email = trimString(baseInfo?.contact?.email);
   const phoneCode = trimString(baseInfo?.contact?.phoneCode);
   const phoneNumber = trimString(baseInfo?.contact?.phoneNumber);
-  const formattedPhone = phoneCode && phoneNumber ? `${phoneCode} ${phoneNumber}`.trim() : formatPhone(baseInfo?.contact);
+  const formattedPhone =
+    phoneCode && phoneNumber
+      ? `${phoneCode} ${phoneNumber}`.trim()
+      : formatPhone(baseInfo?.contact);
   const address = trimString(baseInfo?.location?.address);
   const city = trimString(baseInfo?.location?.city);
   const state = trimString(baseInfo?.location?.state);
   const country = trimString(baseInfo?.location?.country);
   const postalCode = trimString(baseInfo?.location?.postalCode);
-  const linkedin = trimString(baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin);
-  const jobTitle = trimString(baseInfo?.career?.jobTitle) || trimString((jobContext as any)?.job_title);
+  const linkedin = trimString(baseInfo?.links?.linkedin);
+  const jobTitle =
+    trimString(baseInfo?.career?.jobTitle) ||
+    trimString((jobContext as any)?.job_title);
   const currentCompany =
-    trimString(baseInfo?.career?.currentCompany) || trimString((jobContext as any)?.company) || trimString((jobContext as any)?.employer);
-  const yearsExp = trimString(baseInfo?.career?.yearsExp ?? parsedResume?.years_experience_general);
+    trimString(baseInfo?.career?.currentCompany) ||
+    trimString((jobContext as any)?.company) ||
+    trimString((jobContext as any)?.employer);
+  const yearsExp = trimString(baseInfo?.career?.yearsExp);
   const desiredSalary = trimString(baseInfo?.career?.desiredSalary);
   const hourlyRate = computeHourlyRate(desiredSalary);
   const school = trimString(baseInfo?.education?.school);
   const degree = trimString(baseInfo?.education?.degree);
   const majorField = trimString(baseInfo?.education?.majorField);
   const graduationDate = trimString(baseInfo?.education?.graduationAt);
-  const currentLocation = [city, state, country].filter(Boolean).join(', ');
+  const currentLocation = [city, state, country].filter(Boolean).join(", ");
   const phoneCountryCode =
-    phoneCode || (formattedPhone.startsWith('+') ? formattedPhone.split(/\s+/)[0] : trimString(baseInfo?.contact?.phone));
+    phoneCode ||
+    (formattedPhone.startsWith("+")
+      ? formattedPhone.split(/\s+/)[0]
+      : trimString(baseInfo?.contact?.phone));
 
   const values: Record<string, string> = {
     full_name: fullName,
     first_name: firstName,
     last_name: lastName,
     preferred_name: firstName || fullName,
-    pronouns: 'Mr',
+    pronouns: "Mr",
     email,
     phone: formattedPhone,
     phone_country_code: phoneCountryCode,
@@ -174,24 +340,24 @@ function buildAutofillValueMap(
     current_company: currentCompany,
     years_experience: yearsExp,
     desired_salary: desiredSalary,
-    hourly_rate: hourlyRate !== undefined ? String(hourlyRate) : '',
-    start_date: 'immediately',
-    notice_period: '0',
+    hourly_rate: hourlyRate !== undefined ? String(hourlyRate) : "",
+    start_date: "immediately",
+    notice_period: "0",
     school,
     degree,
     major_field: majorField,
     graduation_date: graduationDate,
-    eeo_gender: 'man',
-    eeo_race_ethnicity: 'white',
-    eeo_veteran: 'no veteran',
-    eeo_disability: 'no disability',
+    eeo_gender: "man",
+    eeo_race_ethnicity: "white",
+    eeo_veteran: "no veteran",
+    eeo_disability: "no disability",
   };
   return values;
 }
 
 function sanitizeText(input: string | undefined | null) {
-  if (!input) return '';
-  return input.replace(/\u0000/g, '');
+  if (!input) return "";
+  return input.replace(/\u0000/g, "");
 }
 
 function looksBinary(buf: Buffer) {
@@ -214,7 +380,7 @@ async function extractResumeTextFromFile(filePath: string, fileName?: string) {
     const buf = await fs.readFile(filePath);
 
     // Try magic-header detection for PDF when extension is missing/misleading.
-    if (buf.subarray(0, 4).toString() === '%PDF') {
+    if (buf.subarray(0, 4).toString() === "%PDF") {
       try {
         const parsed = await pdfParse(buf);
         if (parsed.text?.trim()) return sanitizeText(parsed.text);
@@ -223,31 +389,34 @@ async function extractResumeTextFromFile(filePath: string, fileName?: string) {
       }
     }
 
-    if (ext === '.txt') {
-      return sanitizeText(buf.toString('utf8'));
+    if (ext === ".txt") {
+      return sanitizeText(buf.toString("utf8"));
     }
-    if (ext === '.docx') {
+    if (ext === ".docx") {
       const res = await extractRawText({ path: filePath });
-      return sanitizeText(res.value ?? '');
+      return sanitizeText(res.value ?? "");
     }
-    if (ext === '.pdf') {
+    if (ext === ".pdf") {
       const parsed = await pdfParse(buf);
-      return sanitizeText(parsed.text ?? '');
+      return sanitizeText(parsed.text ?? "");
     }
     if (looksBinary(buf)) {
-      return '';
+      return "";
     }
-    return sanitizeText(buf.toString('utf8'));
+    return sanitizeText(buf.toString("utf8"));
   } catch (err) {
-    console.error('extractResumeTextFromFile failed', err);
-    return '';
+    console.error("extractResumeTextFromFile failed", err);
+    return "";
   }
 }
 
-async function saveParsedResumeJson(resumeId: string, parsed: unknown) {
-}
+async function saveParsedResumeJson(resumeId: string, parsed: unknown) {}
 
-async function tryParseResumeText(resumeId: string, resumeText: string, baseProfile?: BaseInfo) {
+async function tryParseResumeText(
+  resumeId: string,
+  resumeText: string,
+  baseProfile?: BaseInfo
+) {
   if (!resumeText?.trim()) return undefined;
   try {
     const prompt = promptBuilders.buildResumeParsePrompt({
@@ -259,7 +428,7 @@ async function tryParseResumeText(resumeId: string, resumeText: string, baseProf
     if (parsed?.result) return parsed.result;
     if (parsed) return parsed;
   } catch (err) {
-    console.error('LLM resume parse failed', err);
+    console.error("LLM resume parse failed", err);
   }
   return simpleParseResume(resumeText);
 }
@@ -271,17 +440,22 @@ function simpleParseResume(resumeText: string) {
     .filter(Boolean);
   const emailMatch = resumeText.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i);
   const phoneMatch = resumeText.match(/(\+?\d[\d\s\-\(\)]{8,})/);
-  const nameLine = lines.find((l) => l && l.length <= 80 && !l.includes('@') && !/\d/.test(l));
-  const summary = lines.slice(0, 6).join(' ').slice(0, 600);
+  const nameLine = lines.find(
+    (l) => l && l.length <= 80 && !l.includes("@") && !/\d/.test(l)
+  );
+  const summary = lines.slice(0, 6).join(" ").slice(0, 600);
 
   const skillsIdx = lines.findIndex((l) => /skill/i.test(l));
-  const skillsLine = skillsIdx >= 0 ? lines.slice(skillsIdx + 1, skillsIdx + 4).join(', ') : '';
+  const skillsLine =
+    skillsIdx >= 0 ? lines.slice(skillsIdx + 1, skillsIdx + 4).join(", ") : "";
   const skills = skillsLine
     .split(/[,;]+/)
     .map((s) => s.trim())
     .filter((s) => s.length > 1)
     .slice(0, 20);
-  const linkedinMatch = resumeText.match(/https?:\/\/(?:www\.)?linkedin\.com\/[^\s)]+/i);
+  const linkedinMatch = resumeText.match(
+    /https?:\/\/(?:www\.)?linkedin\.com\/[^\s)]+/i
+  );
 
   // Section detection
   const workIdx = lines.findIndex((l) => /work\s+experience/i.test(l));
@@ -302,7 +476,8 @@ function simpleParseResume(resumeText: string) {
   function parseWork(blocks: string[]) {
     const items: any[] = [];
     let current: any | null = null;
-    const datePattern = /(\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s*\d{4})/i;
+    const datePattern =
+      /(\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\.?\s*\d{4})/i;
     const rangePattern = /(\d{4})\s*[–-]\s*(Present|\d{4})/i;
     const bulletPattern = /^[\u2022*\-•]+\s*/;
     for (const l of blocks) {
@@ -310,30 +485,46 @@ function simpleParseResume(resumeText: string) {
       if (!isBullet) {
         // treat as new role/company line when it looks like a heading
         const looksLikeRole =
-          /engineer|developer|manager|lead|architect|consultant|specialist|director/i.test(l) ||
+          /engineer|developer|manager|lead|architect|consultant|specialist|director/i.test(
+            l
+          ) ||
           rangePattern.test(l) ||
           datePattern.test(l);
         if (current) items.push(current);
         if (looksLikeRole) {
           const dates = l.match(rangePattern) || l.match(datePattern);
           const parts = l.split(/[–-]/);
-          const titlePart = parts[0]?.trim() ?? '';
-          const companyPart = parts.slice(1).join('-').replace(rangePattern, '').replace(datePattern, '').trim();
+          const titlePart = parts[0]?.trim() ?? "";
+          const companyPart = parts
+            .slice(1)
+            .join("-")
+            .replace(rangePattern, "")
+            .replace(datePattern, "")
+            .trim();
           current = {
-            company: companyPart || l.replace(rangePattern, '').replace(datePattern, '').trim(),
-            title: titlePart || '',
-            start_date: dates ? dates[1] ?? '' : '',
-            end_date: dates && dates[2] ? dates[2] : '',
-            location: '',
+            company:
+              companyPart ||
+              l.replace(rangePattern, "").replace(datePattern, "").trim(),
+            title: titlePart || "",
+            start_date: dates ? dates[1] ?? "" : "",
+            end_date: dates && dates[2] ? dates[2] : "",
+            location: "",
             bullets: [] as string[],
           };
         } else if (current) {
           current.company = `${current.company} ${l}`.trim();
         } else {
-          current = { company: l, title: '', start_date: '', end_date: '', location: '', bullets: [] as string[] };
+          current = {
+            company: l,
+            title: "",
+            start_date: "",
+            end_date: "",
+            location: "",
+            bullets: [] as string[],
+          };
         }
       } else if (current) {
-        current.bullets.push(l.replace(bulletPattern, '').trim());
+        current.bullets.push(l.replace(bulletPattern, "").trim());
       }
     }
     if (current) items.push(current);
@@ -342,15 +533,16 @@ function simpleParseResume(resumeText: string) {
 
   function parseEducation(blocks: string[]) {
     const edu: any[] = [];
-    const degreePattern = /(bachelor|master|mba|phd|b\.sc|m\.sc|bachelor’s|master’s)/i;
+    const degreePattern =
+      /(bachelor|master|mba|phd|b\.sc|m\.sc|bachelor’s|master’s)/i;
     for (const l of blocks) {
       if (!l) continue;
-      const degree = (l.match(degreePattern) || [])[0] ?? '';
+      const degree = (l.match(degreePattern) || [])[0] ?? "";
       edu.push({
-        degree: degree || '',
-        field: '',
-        start_date: '',
-        end_date: '',
+        degree: degree || "",
+        field: "",
+        start_date: "",
+        end_date: "",
         details: [l],
       });
       if (edu.length >= 4) break;
@@ -358,18 +550,20 @@ function simpleParseResume(resumeText: string) {
     return edu;
   }
 
-  const experience = parseWork(workLines.length ? workLines : lines).map((e) => ({
-    company: e.company || null,
-    title: e.title || null,
-    start_date: e.start_date || null,
-    end_date: e.end_date || null,
-    location: e.location || null,
-    bullets: (e.bullets || []).filter((b: string) => b),
-  }));
+  const experience = parseWork(workLines.length ? workLines : lines).map(
+    (e) => ({
+      company: e.company || null,
+      title: e.title || null,
+      start_date: e.start_date || null,
+      end_date: e.end_date || null,
+      location: e.location || null,
+      bullets: (e.bullets || []).filter((b: string) => b),
+    })
+  );
   const education = parseEducation(educationLines);
 
   return {
-    name: nameLine || '',
+    name: nameLine || "",
     contact_info: {
       email: emailMatch?.[0] || null,
       phone: phoneMatch?.[0]?.trim() || null,
@@ -398,281 +592,361 @@ function simpleParseResume(resumeText: string) {
   };
 }
 
-async function collectPageFieldsFromFrame(frame: Frame, meta: { frameUrl: string; frameName: string }) {
+async function collectPageFieldsFromFrame(
+  frame: Frame,
+  meta: { frameUrl: string; frameName: string }
+) {
   return frame.evaluate(
     (frameInfo) => {
-    const norm = (s?: string | null) => (s || '').replace(/\s+/g, ' ').trim();
-    const textOf = (el?: Element | null) => norm(el?.textContent || (el as HTMLElement | null)?.innerText || '');
-    const isVisible = (el: Element) => {
-      const cs = window.getComputedStyle(el);
-      if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return false;
-      const r = el.getBoundingClientRect();
-      return r.width > 0 && r.height > 0;
-    };
-    const esc = (v: string) =>
-      (window.CSS && CSS.escape ? CSS.escape(v) : v.replace(/[^a-zA-Z0-9_-]/g, '\\$&'));
+      const norm = (s?: string | null) => (s || "").replace(/\s+/g, " ").trim();
+      const textOf = (el?: Element | null) =>
+        norm(el?.textContent || (el as HTMLElement | null)?.innerText || "");
+      const isVisible = (el: Element) => {
+        const cs = window.getComputedStyle(el);
+        if (!cs || cs.display === "none" || cs.visibility === "hidden")
+          return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const esc = (v: string) =>
+        window.CSS && CSS.escape
+          ? CSS.escape(v)
+          : v.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
 
-    const getLabelText = (el: Element) => {
-      try {
-        const labels = (el as HTMLInputElement).labels;
-        if (labels && labels.length) {
-          const t = Array.from(labels)
-            .map((n) => textOf(n))
-            .filter(Boolean);
-          if (t.length) return t.join(' ');
+      const getLabelText = (el: Element) => {
+        try {
+          const labels = (el as HTMLInputElement).labels;
+          if (labels && labels.length) {
+            const t = Array.from(labels)
+              .map((n) => textOf(n))
+              .filter(Boolean);
+            if (t.length) return t.join(" ");
+          }
+        } catch {
+          /* ignore */
         }
-      } catch {
-        /* ignore */
-      }
-      const id = el.getAttribute('id');
-      if (id) {
-        const lab = document.querySelector(`label[for="${esc(id)}"]`);
-        const t = textOf(lab);
-        if (t) return t;
-      }
-      const wrap = el.closest('label');
-      const t2 = textOf(wrap);
-      return t2 || '';
-    };
+        const id = el.getAttribute("id");
+        if (id) {
+          const lab = document.querySelector(`label[for="${esc(id)}"]`);
+          const t = textOf(lab);
+          if (t) return t;
+        }
+        const wrap = el.closest("label");
+        const t2 = textOf(wrap);
+        return t2 || "";
+      };
 
-    const getAriaName = (el: Element) => {
-      const direct = norm(el.getAttribute('aria-label'));
-      if (direct) return direct;
-      const labelledBy = norm(el.getAttribute('aria-labelledby'));
-      if (labelledBy) {
-        const parts = labelledBy
+      const getAriaName = (el: Element) => {
+        const direct = norm(el.getAttribute("aria-label"));
+        if (direct) return direct;
+        const labelledBy = norm(el.getAttribute("aria-labelledby"));
+        if (labelledBy) {
+          const parts = labelledBy
+            .split(/\s+/)
+            .map((id) => textOf(document.getElementById(id)))
+            .filter(Boolean);
+          return norm(parts.join(" "));
+        }
+        return "";
+      };
+
+      const getDescribedBy = (el: Element) => {
+        const ids = norm(el.getAttribute("aria-describedby"));
+        if (!ids) return "";
+        const parts = ids
           .split(/\s+/)
           .map((id) => textOf(document.getElementById(id)))
           .filter(Boolean);
-        return norm(parts.join(' '));
-      }
-      return '';
-    };
+        return norm(parts.join(" "));
+      };
 
-    const getDescribedBy = (el: Element) => {
-      const ids = norm(el.getAttribute('aria-describedby'));
-      if (!ids) return '';
-      const parts = ids
-        .split(/\s+/)
-        .map((id) => textOf(document.getElementById(id)))
-        .filter(Boolean);
-      return norm(parts.join(' '));
-    };
+      const findFieldContainer = (el: Element) =>
+        el.closest(
+          "fieldset, [role='group'], .form-group, .field, .input-group, .question, .formField, section, article, li, div"
+        ) || el.parentElement;
 
-    const findFieldContainer = (el: Element) =>
-      el.closest(
-        "fieldset, [role='group'], .form-group, .field, .input-group, .question, .formField, section, article, li, div"
-      ) || el.parentElement;
+      const collectNearbyPrompts = (el: Element) => {
+        const container = findFieldContainer(el);
+        if (!container) return [];
 
-    const collectNearbyPrompts = (el: Element) => {
-      const container = findFieldContainer(el);
-      if (!container) return [];
+        const prompts: { source: string; text: string }[] = [];
 
-      const prompts: { source: string; text: string }[] = [];
-
-      const fieldset = el.closest('fieldset');
-      if (fieldset) {
-        const legend = fieldset.querySelector('legend');
-        const t = textOf(legend);
-        if (t) prompts.push({ source: 'legend', text: t });
-      }
-
-      const candidates = container.querySelectorAll(
-        "h1,h2,h3,h4,h5,h6,p,.help,.hint,.description,[data-help],[data-testid*='help']"
-      );
-      candidates.forEach((n) => {
-        const t = textOf(n);
-        if (t && t.length <= 350) prompts.push({ source: 'container_text', text: t });
-      });
-
-      let sib: Element | null = el.previousElementSibling;
-      let steps = 0;
-      while (sib && steps < 4) {
-        const tag = sib.tagName.toLowerCase();
-        if (['div', 'p', 'span', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'label'].includes(tag)) {
-          const t = textOf(sib);
-          if (t && t.length <= 350) prompts.push({ source: 'prev_sibling', text: t });
+        const fieldset = el.closest("fieldset");
+        if (fieldset) {
+          const legend = fieldset.querySelector("legend");
+          const t = textOf(legend);
+          if (t) prompts.push({ source: "legend", text: t });
         }
-        sib = sib.previousElementSibling;
-        steps += 1;
-      }
 
-      return prompts;
-    };
-
-    const looksBoilerplate = (t: string) => {
-      const s = t.toLowerCase();
-      return (
-        s.includes('privacy') ||
-        s.includes('terms') ||
-        s.includes('cookies') ||
-        s.includes('equal opportunity') ||
-        s.includes('eeo') ||
-        s.includes('gdpr')
-      );
-    };
-
-    const scorePrompt = (text: string, source: string) => {
-      const s = text.toLowerCase();
-      let score = 0;
-      if (text.includes('?')) score += 6;
-      if (/^(why|how|what|describe|explain|tell us|please describe|please explain)\b/i.test(text)) score += 4;
-      if (/(position|role|motivation|interested|interest|experience|background|cover letter)/i.test(text)) score += 2;
-      if (text.length >= 20 && text.length <= 220) score += 3;
-      if (source === 'label' || source === 'aria') score += 5;
-      if (source === 'describedby') score += 3;
-      if (text.length > 350) score -= 4;
-      if (looksBoilerplate(text)) score -= 6;
-      if (/^(optional|required)\b/i.test(text)) score -= 5;
-      if (s === 'optional' || s === 'required') score -= 5;
-      return score;
-    };
-
-    const parseTextConstraints = (text: string) => {
-      const t = text.toLowerCase();
-      const out: Record<string, number> = {};
-      const words = t.match(/max(?:imum)?\s*(\d+)\s*words?/);
-      if (words) out.max_words = parseInt(words[1], 10);
-      const chars = t.match(/max(?:imum)?\s*(\d+)\s*(characters|chars)/);
-      if (chars) out.max_chars = parseInt(chars[1], 10);
-      const minChars = t.match(/min(?:imum)?\s*(\d+)\s*(characters|chars)/);
-      if (minChars) out.min_chars = parseInt(minChars[1], 10);
-      return out;
-    };
-
-    const recommendedLocators = (el: Element, bestLabel?: string | null) => {
-      const tag = el.tagName.toLowerCase();
-      const id = el.getAttribute('id');
-      const name = el.getAttribute('name');
-      const placeholder = el.getAttribute('placeholder');
-      const locators: Record<string, string> = {};
-      if (id) locators.css = `#${esc(id)}`;
-      else if (name) locators.css = `${tag}[name="${esc(name)}"]`;
-      else locators.css = tag;
-
-      if (bestLabel) locators.playwright = `getByLabel(${JSON.stringify(bestLabel)})`;
-      else if (placeholder) locators.playwright = `getByPlaceholder(${JSON.stringify(placeholder)})`;
-      else locators.playwright = `locator(${JSON.stringify(locators.css)})`;
-      return locators;
-    };
-
-    const slug = (v: string) => norm(v).toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
-
-    const controls = Array.from(
-      document.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]')
-    ).slice(0, 80);
-
-    const fields: any[] = [];
-    controls.forEach((el, idx) => {
-      const tag = el.tagName.toLowerCase();
-      if (tag === 'input') {
-        const t = ((el as HTMLInputElement).type || el.getAttribute('type') || 'text').toLowerCase();
-        if (['hidden', 'submit', 'button', 'image', 'reset'].includes(t)) return;
-      }
-      if (!isVisible(el)) return;
-
-      const label = norm(getLabelText(el));
-      const ariaName = norm(getAriaName(el));
-      const describedBy = norm(getDescribedBy(el));
-      const placeholder = norm(el.getAttribute('placeholder'));
-      const autocomplete = norm(el.getAttribute('autocomplete'));
-      const name = norm(el.getAttribute('name'));
-      const id = norm(el.getAttribute('id'));
-      const required = Boolean((el as HTMLInputElement).required);
-
-      const type =
-        tag === 'input'
-          ? (norm((el as HTMLInputElement).type || el.getAttribute('type')) || 'text').toLowerCase()
-          : tag === 'textarea'
-            ? 'textarea'
-            : tag === 'select'
-              ? 'select'
-              : (el.getAttribute('role') === 'textbox' || el.getAttribute('contenteditable') === 'true')
-                ? 'richtext'
-                : tag;
-
-      const promptCandidates: { source: string; text: string; score: number }[] = [];
-      if (label) promptCandidates.push({ source: 'label', text: label, score: scorePrompt(label, 'label') + 8 });
-      if (ariaName) promptCandidates.push({ source: 'aria', text: ariaName, score: scorePrompt(ariaName, 'aria') });
-      if (placeholder) {
-        promptCandidates.push({
-          source: 'placeholder',
-          text: placeholder,
-          score: scorePrompt(placeholder, 'placeholder'),
+        const candidates = container.querySelectorAll(
+          "h1,h2,h3,h4,h5,h6,p,.help,.hint,.description,[data-help],[data-testid*='help']"
+        );
+        candidates.forEach((n) => {
+          const t = textOf(n);
+          if (t && t.length <= 350)
+            prompts.push({ source: "container_text", text: t });
         });
-      }
-      if (describedBy) {
-        promptCandidates.push({
-          source: 'describedby',
-          text: describedBy,
-          score: scorePrompt(describedBy, 'describedby'),
+
+        let sib: Element | null = el.previousElementSibling;
+        let steps = 0;
+        while (sib && steps < 4) {
+          const tag = sib.tagName.toLowerCase();
+          if (
+            [
+              "div",
+              "p",
+              "span",
+              "h1",
+              "h2",
+              "h3",
+              "h4",
+              "h5",
+              "h6",
+              "label",
+            ].includes(tag)
+          ) {
+            const t = textOf(sib);
+            if (t && t.length <= 350)
+              prompts.push({ source: "prev_sibling", text: t });
+          }
+          sib = sib.previousElementSibling;
+          steps += 1;
+        }
+
+        return prompts;
+      };
+
+      const looksBoilerplate = (t: string) => {
+        const s = t.toLowerCase();
+        return (
+          s.includes("privacy") ||
+          s.includes("terms") ||
+          s.includes("cookies") ||
+          s.includes("equal opportunity") ||
+          s.includes("eeo") ||
+          s.includes("gdpr")
+        );
+      };
+
+      const scorePrompt = (text: string, source: string) => {
+        const s = text.toLowerCase();
+        let score = 0;
+        if (text.includes("?")) score += 6;
+        if (
+          /^(why|how|what|describe|explain|tell us|please describe|please explain)\b/i.test(
+            text
+          )
+        )
+          score += 4;
+        if (
+          /(position|role|motivation|interested|interest|experience|background|cover letter)/i.test(
+            text
+          )
+        )
+          score += 2;
+        if (text.length >= 20 && text.length <= 220) score += 3;
+        if (source === "label" || source === "aria") score += 5;
+        if (source === "describedby") score += 3;
+        if (text.length > 350) score -= 4;
+        if (looksBoilerplate(text)) score -= 6;
+        if (/^(optional|required)\b/i.test(text)) score -= 5;
+        if (s === "optional" || s === "required") score -= 5;
+        return score;
+      };
+
+      const parseTextConstraints = (text: string) => {
+        const t = text.toLowerCase();
+        const out: Record<string, number> = {};
+        const words = t.match(/max(?:imum)?\s*(\d+)\s*words?/);
+        if (words) out.max_words = parseInt(words[1], 10);
+        const chars = t.match(/max(?:imum)?\s*(\d+)\s*(characters|chars)/);
+        if (chars) out.max_chars = parseInt(chars[1], 10);
+        const minChars = t.match(/min(?:imum)?\s*(\d+)\s*(characters|chars)/);
+        if (minChars) out.min_chars = parseInt(minChars[1], 10);
+        return out;
+      };
+
+      const recommendedLocators = (el: Element, bestLabel?: string | null) => {
+        const tag = el.tagName.toLowerCase();
+        const id = el.getAttribute("id");
+        const name = el.getAttribute("name");
+        const placeholder = el.getAttribute("placeholder");
+        const locators: Record<string, string> = {};
+        if (id) locators.css = `#${esc(id)}`;
+        else if (name) locators.css = `${tag}[name="${esc(name)}"]`;
+        else locators.css = tag;
+
+        if (bestLabel)
+          locators.playwright = `getByLabel(${JSON.stringify(bestLabel)})`;
+        else if (placeholder)
+          locators.playwright = `getByPlaceholder(${JSON.stringify(
+            placeholder
+          )})`;
+        else locators.playwright = `locator(${JSON.stringify(locators.css)})`;
+        return locators;
+      };
+
+      const slug = (v: string) =>
+        norm(v)
+          .toLowerCase()
+          .replace(/[^a-z0-9]+/g, "_")
+          .replace(/^_+|_+$/g, "");
+
+      const controls = Array.from(
+        document.querySelectorAll(
+          'input, textarea, select, [contenteditable="true"], [role="textbox"]'
+        )
+      ).slice(0, 80);
+
+      const fields: any[] = [];
+      controls.forEach((el, idx) => {
+        const tag = el.tagName.toLowerCase();
+        if (tag === "input") {
+          const t = (
+            (el as HTMLInputElement).type ||
+            el.getAttribute("type") ||
+            "text"
+          ).toLowerCase();
+          if (["hidden", "submit", "button", "image", "reset"].includes(t))
+            return;
+        }
+        if (!isVisible(el)) return;
+
+        const label = norm(getLabelText(el));
+        const ariaName = norm(getAriaName(el));
+        const describedBy = norm(getDescribedBy(el));
+        const placeholder = norm(el.getAttribute("placeholder"));
+        const autocomplete = norm(el.getAttribute("autocomplete"));
+        const name = norm(el.getAttribute("name"));
+        const id = norm(el.getAttribute("id"));
+        const required = Boolean((el as HTMLInputElement).required);
+
+        const type =
+          tag === "input"
+            ? (
+                norm(
+                  (el as HTMLInputElement).type || el.getAttribute("type")
+                ) || "text"
+              ).toLowerCase()
+            : tag === "textarea"
+            ? "textarea"
+            : tag === "select"
+            ? "select"
+            : el.getAttribute("role") === "textbox" ||
+              el.getAttribute("contenteditable") === "true"
+            ? "richtext"
+            : tag;
+
+        const promptCandidates: {
+          source: string;
+          text: string;
+          score: number;
+        }[] = [];
+        if (label)
+          promptCandidates.push({
+            source: "label",
+            text: label,
+            score: scorePrompt(label, "label") + 8,
+          });
+        if (ariaName)
+          promptCandidates.push({
+            source: "aria",
+            text: ariaName,
+            score: scorePrompt(ariaName, "aria"),
+          });
+        if (placeholder) {
+          promptCandidates.push({
+            source: "placeholder",
+            text: placeholder,
+            score: scorePrompt(placeholder, "placeholder"),
+          });
+        }
+        if (describedBy) {
+          promptCandidates.push({
+            source: "describedby",
+            text: describedBy,
+            score: scorePrompt(describedBy, "describedby"),
+          });
+        }
+        const nearbyPrompts = collectNearbyPrompts(el);
+        nearbyPrompts.forEach((p) => {
+          promptCandidates.push({ ...p, score: scorePrompt(p.text, p.source) });
         });
-      }
-      const nearbyPrompts = collectNearbyPrompts(el);
-      nearbyPrompts.forEach((p) => {
-        promptCandidates.push({ ...p, score: scorePrompt(p.text, p.source) });
+
+        const best =
+          label && promptCandidates.find((p) => p.source === "label")
+            ? promptCandidates.find((p) => p.source === "label")
+            : promptCandidates
+                .filter((p) => p.text)
+                .sort((a, b) => b.score - a.score)[0];
+        const questionText = best?.text || "";
+        const locators = recommendedLocators(
+          el,
+          label || ariaName || questionText || placeholder
+        );
+
+        const constraints: Record<string, number> = {};
+        const maxlen = el.getAttribute("maxlength");
+        const minlen = el.getAttribute("minlength");
+        if (maxlen) constraints.maxlength = parseInt(maxlen, 10);
+        if (minlen) constraints.minlength = parseInt(minlen, 10);
+        Object.assign(
+          constraints,
+          parseTextConstraints(`${questionText} ${describedBy}`)
+        );
+
+        const textForEssay =
+          `${questionText} ${label} ${describedBy}`.toLowerCase();
+        const likelyEssay =
+          type === "textarea" ||
+          type === "richtext" ||
+          Boolean(constraints.max_words) ||
+          Boolean(constraints.max_chars && constraints.max_chars > 180) ||
+          (/why|tell us|describe|explain|motivation|interest|cover letter|statement/.test(
+            textForEssay
+          ) &&
+            (questionText.length > 0 || label.length > 0));
+
+        const fallbackId =
+          slug(
+            label || ariaName || questionText || placeholder || name || ""
+          ) || `field_${idx}`;
+        const fieldId = id || name || fallbackId;
+
+        fields.push({
+          index: fields.length,
+          field_id: fieldId,
+          tag,
+          type,
+          id: id || null,
+          name: name || null,
+          label: label || null,
+          ariaName: ariaName || null,
+          placeholder: placeholder || null,
+          describedBy: describedBy || null,
+          autocomplete: autocomplete || null,
+          required,
+          visible: true,
+          questionText: questionText || null,
+          questionCandidates: promptCandidates
+            .sort((a, b) => b.score - a.score)
+            .slice(0, 5),
+          constraints,
+          locators: {
+            css: locators.css,
+            playwright: locators.playwright,
+          },
+          selector: locators.css,
+          likelyEssay,
+          containerPrompts: nearbyPrompts,
+          frameUrl: frameInfo.frameUrl,
+          frameName: frameInfo.frameName,
+        });
       });
 
-      const best =
-        label && promptCandidates.find((p) => p.source === 'label')
-          ? promptCandidates.find((p) => p.source === 'label')
-          : promptCandidates.filter((p) => p.text).sort((a, b) => b.score - a.score)[0];
-      const questionText = best?.text || '';
-      const locators = recommendedLocators(el, label || ariaName || questionText || placeholder);
-
-      const constraints: Record<string, number> = {};
-      const maxlen = el.getAttribute('maxlength');
-      const minlen = el.getAttribute('minlength');
-      if (maxlen) constraints.maxlength = parseInt(maxlen, 10);
-      if (minlen) constraints.minlength = parseInt(minlen, 10);
-      Object.assign(constraints, parseTextConstraints(`${questionText} ${describedBy}`));
-
-      const textForEssay = `${questionText} ${label} ${describedBy}`.toLowerCase();
-      const likelyEssay =
-        type === 'textarea' ||
-        type === 'richtext' ||
-        Boolean(constraints.max_words) ||
-        Boolean(constraints.max_chars && constraints.max_chars > 180) ||
-        (/why|tell us|describe|explain|motivation|interest|cover letter|statement/.test(textForEssay) &&
-          (questionText.length > 0 || label.length > 0));
-
-      const fallbackId = slug(label || ariaName || questionText || placeholder || name || '') || `field_${idx}`;
-      const fieldId = id || name || fallbackId;
-
-      fields.push({
-        index: fields.length,
-        field_id: fieldId,
-        tag,
-        type,
-        id: id || null,
-        name: name || null,
-        label: label || null,
-        ariaName: ariaName || null,
-        placeholder: placeholder || null,
-        describedBy: describedBy || null,
-        autocomplete: autocomplete || null,
-        required,
-        visible: true,
-        questionText: questionText || null,
-        questionCandidates: promptCandidates
-          .sort((a, b) => b.score - a.score)
-          .slice(0, 5),
-        constraints,
-        locators: {
-          css: locators.css,
-          playwright: locators.playwright,
-        },
-        selector: locators.css,
-        likelyEssay,
-        containerPrompts: nearbyPrompts,
-        frameUrl: frameInfo.frameUrl,
-        frameName: frameInfo.frameName,
-      });
-    });
-
-    return fields;
-  },
-    { frameUrl: meta.frameUrl, frameName: meta.frameName },
+      return fields;
+    },
+    { frameUrl: meta.frameUrl, frameName: meta.frameName }
   );
 }
 
@@ -686,10 +960,10 @@ async function collectPageFields(page: Page) {
           frameName: frame.name() || `frame-${idx}`,
         });
       } catch (err) {
-        console.error('collectPageFields frame failed', err);
+        console.error("collectPageFields frame failed", err);
         return [];
       }
-    }),
+    })
   );
   const merged = results.flat();
   if (merged.length) return merged.slice(0, 300);
@@ -698,7 +972,7 @@ async function collectPageFields(page: Page) {
   try {
     return await collectPageFieldsFromFrame(page.mainFrame(), {
       frameUrl: page.mainFrame().url(),
-      frameName: page.mainFrame().name() || 'main',
+      frameName: page.mainFrame().name() || "main",
     });
   } catch {
     return [];
@@ -715,28 +989,36 @@ async function applyFillPlan(page: Page, plan: any[]): Promise<FillPlanResult> {
     const value = f.value;
     const selector =
       f.selector ||
-      (f.field_id ? `[name="${f.field_id}"], #${f.field_id}, [id*="${f.field_id}"]` : undefined);
+      (f.field_id
+        ? `[name="${f.field_id}"], #${f.field_id}, [id*="${f.field_id}"]`
+        : undefined);
     if (!selector) {
-      blocked.push(f.field_id ?? 'field');
+      blocked.push(f.field_id ?? "field");
       continue;
     }
     try {
-      if (action === 'fill') {
-        await page.fill(selector, typeof value === 'string' ? value : String(value ?? ''));
+      if (action === "fill") {
+        await page.fill(
+          selector,
+          typeof value === "string" ? value : String(value ?? "")
+        );
         filled.push({
           field: f.field_id ?? selector,
-          value: typeof value === 'string' ? value : JSON.stringify(value ?? ''),
-          confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
+          value:
+            typeof value === "string" ? value : JSON.stringify(value ?? ""),
+          confidence:
+            typeof f.confidence === "number" ? f.confidence : undefined,
         });
-      } else if (action === 'select') {
-        await page.selectOption(selector, { label: String(value ?? '') });
+      } else if (action === "select") {
+        await page.selectOption(selector, { label: String(value ?? "") });
         filled.push({
           field: f.field_id ?? selector,
-          value: String(value ?? ''),
-          confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
+          value: String(value ?? ""),
+          confidence:
+            typeof f.confidence === "number" ? f.confidence : undefined,
         });
-      } else if (action === 'check' || action === 'uncheck') {
-        if (action === 'check') await page.check(selector);
+      } else if (action === "check" || action === "uncheck") {
+        if (action === "check") await page.check(selector);
         else await page.uncheck(selector);
         filled.push({ field: f.field_id ?? selector, value: action });
       } else if (f.requires_user_review) {
@@ -751,38 +1033,76 @@ async function applyFillPlan(page: Page, plan: any[]): Promise<FillPlanResult> {
 
 function collectLabelCandidates(field: any): string[] {
   const candidates: string[] = [];
-  const primaryPrompt = Array.isArray(field?.questionCandidates) && field.questionCandidates.length > 0
-    ? field.questionCandidates[0].text
-    : undefined;
-  [primaryPrompt, field?.questionText, field?.label, field?.ariaName, field?.placeholder, field?.describedBy, field?.field_id, field?.name, field?.id]
-    .forEach((t) => {
-      if (typeof t === 'string' && t.trim()) candidates.push(t);
-    });
+  const primaryPrompt =
+    Array.isArray(field?.questionCandidates) &&
+    field.questionCandidates.length > 0
+      ? field.questionCandidates[0].text
+      : undefined;
+  [
+    primaryPrompt,
+    field?.questionText,
+    field?.label,
+    field?.ariaName,
+    field?.placeholder,
+    field?.describedBy,
+    field?.field_id,
+    field?.name,
+    field?.id,
+  ].forEach((t) => {
+    if (typeof t === "string" && t.trim()) candidates.push(t);
+  });
   if (Array.isArray(field?.containerPrompts)) {
     field.containerPrompts.forEach((p: any) => {
-      if (p?.text && typeof p.text === 'string' && p.text.trim()) candidates.push(p.text);
+      if (p?.text && typeof p.text === "string" && p.text.trim())
+        candidates.push(p.text);
     });
   }
   return candidates;
 }
 
-const SKIP_KEYS = new Set(['cover_letter']);
+function escapeCssValue(value: string) {
+  return value.replace(/["\\]/g, "\\$&");
+}
 
-async function fillFieldsWithAliases(
-  page: Page | undefined | null,
+function escapeCssIdent(value: string) {
+  return value.replace(/[^a-zA-Z0-9_-]/g, "\\$&");
+}
+
+function buildFieldSelector(field: any): string | undefined {
+  if (field?.selector && typeof field.selector === "string")
+    return field.selector;
+  if (field?.locators?.css && typeof field.locators.css === "string")
+    return field.locators.css;
+  if (field?.id) return `#${escapeCssIdent(String(field.id))}`;
+  if (field?.field_id)
+    return `[name="${escapeCssValue(String(field.field_id))}"]`;
+  if (field?.name) return `[name="${escapeCssValue(String(field.name))}"]`;
+  return undefined;
+}
+
+function inferFieldAction(field: any): FillPlanAction["action"] {
+  const rawType = String(field?.type ?? "").toLowerCase();
+  if (rawType === "select") return "select";
+  return "fill";
+}
+
+const SKIP_KEYS = new Set(["cover_letter"]);
+
+function buildAliasFillPlan(
   fields: any[],
   aliasIndex: Map<string, string>,
-  valueMap: Record<string, string>,
-): Promise<FillPlanResult> {
+  valueMap: Record<string, string>
+): FillPlanResult {
   const filled: { field: string; value: string; confidence?: number }[] = [];
   const suggestions: { field: string; suggestion: string }[] = [];
   const blocked: string[] = [];
+  const actions: FillPlanAction[] = [];
   const seen = new Set<string>();
 
   for (const field of fields ?? []) {
     const candidates = collectLabelCandidates(field);
     let matchedKey: string | undefined;
-    let matchedLabel = '';
+    let matchedLabel = "";
     for (const c of candidates) {
       const match = matchLabelToCanonical(c, aliasIndex);
       if (match) {
@@ -795,88 +1115,58 @@ async function fillFieldsWithAliases(
     if (SKIP_KEYS.has(matchedKey)) continue;
 
     const value = trimString(valueMap[matchedKey]);
-    const fieldName = trimString(field?.field_id || field?.name || field?.id || matchedLabel || matchedKey) || matchedKey;
+    const fieldName =
+      trimString(
+        field?.field_id ||
+          field?.name ||
+          field?.id ||
+          matchedLabel ||
+          matchedKey
+      ) || matchedKey;
     if (seen.has(fieldName)) continue;
     seen.add(fieldName);
 
     if (!value) {
-      suggestions.push({ field: fieldName, suggestion: `No data available for ${matchedKey}` });
+      suggestions.push({
+        field: fieldName,
+        suggestion: `No data available for ${matchedKey}`,
+      });
       continue;
     }
 
-    const selector = field?.selector || field?.locators?.css;
-    const labelText = matchedLabel || field?.label || field?.questionText || field?.ariaName || fieldName;
-    const tryFrames = page
-      ? (() => {
-          const main = page.mainFrame();
-          const frames = page.frames().filter((f) => f !== main);
-          return [main, ...frames];
-        })()
-      : [];
-    const tryFill = async (): Promise<boolean> => {
-      if (!page || !selector) return false;
-      for (const targetFrame of tryFrames) {
-        try {
-          const trySelectByLabel = async () => targetFrame.selectOption(selector, { label: value });
-          const trySelectByValue = async () => targetFrame.selectOption(selector, { value });
-          const trySelectByGetByLabel = async () => {
-            const lbl = labelText?.trim();
-            if (!lbl) throw new Error('no label for select');
-            await targetFrame.getByLabel(lbl, { exact: false }).selectOption({ label: value }).catch(async () => {
-              await targetFrame.getByLabel(lbl, { exact: false }).selectOption({ value });
-            });
-          };
-          const tryFillByLabel = async () => {
-            const lbl = labelText?.trim();
-            if (!lbl) throw new Error('no label for fill');
-            await targetFrame.getByLabel(lbl, { exact: false }).fill(value);
-          };
-
-          if (field?.type === 'select') {
-            const opt = await targetFrame.$(selector);
-            if (opt) {
-              await trySelectByLabel()
-                .catch(trySelectByValue)
-                .catch(async () => {
-                  await targetFrame.selectOption(selector, { label: value }).catch(async () => {
-                    await targetFrame.selectOption(selector, { value }).catch(async () => {
-                      await opt.focus();
-                      await targetFrame.keyboard.type(value);
-                    });
-                  });
-                })
-                .catch(() => trySelectByGetByLabel().catch(() => {}));
-            } else {
-              await trySelectByGetByLabel();
-            }
-          } else {
-            await targetFrame.fill(selector, value).catch(async () => {
-              await tryFillByLabel();
-            });
-          }
-          return true;
-        } catch {
-          continue;
-        }
-      }
-      return false;
-    };
-
-    const success = await tryFill();
-    if (success) {
-      filled.push({ field: fieldName, value, confidence: 0.9 });
-    } else if (!page) {
-      filled.push({ field: fieldName, value, confidence: 0.75 });
-    } else {
+    const selector = buildFieldSelector(field);
+    const fieldId = trimString(field?.field_id || field?.name || field?.id);
+    const fieldLabel = trimString(
+      matchedLabel ||
+        field?.label ||
+        field?.questionText ||
+        field?.ariaName ||
+        fieldName
+    );
+    if (!selector) {
       blocked.push(fieldName);
+      continue;
     }
+    const action = inferFieldAction(field);
+    actions.push({
+      field: fieldName,
+      field_id: fieldId || undefined,
+      label: fieldLabel || undefined,
+      selector,
+      action,
+      value,
+      confidence: 0.75,
+    });
+    filled.push({ field: fieldName, value, confidence: 0.75 });
   }
 
-  return { filled, suggestions, blocked };
+  return { filled, suggestions, blocked, actions };
 }
 
 function shouldSkipPlanField(field: any, aliasIndex: Map<string, string>) {
-  const candidates = [field?.field_id, field?.label, field?.selector].filter((c) => typeof c === 'string' && c.trim());
+  const candidates = [field?.field_id, field?.label, field?.selector].filter(
+    (c) => typeof c === "string" && c.trim()
+  );
   for (const c of candidates) {
     const match = matchLabelToCanonical(String(c), aliasIndex);
     if (match && SKIP_KEYS.has(match)) return true;
@@ -884,8 +1174,14 @@ function shouldSkipPlanField(field: any, aliasIndex: Map<string, string>) {
   return false;
 }
 
-async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any): Promise<FillPlanResult> {
-  const fullName = [baseInfo?.name?.first, baseInfo?.name?.last].filter(Boolean).join(' ').trim();
+async function simplePageFill(
+  page: Page,
+  baseInfo: BaseInfo
+): Promise<FillPlanResult> {
+  const fullName = [baseInfo?.name?.first, baseInfo?.name?.last]
+    .filter(Boolean)
+    .join(" ")
+    .trim();
   const email = trimString(baseInfo?.contact?.email);
   const phoneCode = trimString(baseInfo?.contact?.phoneCode);
   const phoneNumber = trimString(baseInfo?.contact?.phoneNumber);
@@ -895,12 +1191,10 @@ async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any
   const state = trimString(baseInfo?.location?.state);
   const country = trimString(baseInfo?.location?.country);
   const postalCode = trimString(baseInfo?.location?.postalCode);
-  const linkedin = trimString(baseInfo?.links?.linkedin || parsedResume?.contact_info?.links?.linkedin);
-  const company = trimString(
-    baseInfo?.career?.currentCompany || parsedResume?.experience?.[0]?.company || parsedResume?.experience?.[0]?.employer,
-  );
-  const title = trimString(baseInfo?.career?.jobTitle || parsedResume?.experience?.[0]?.title);
-  const yearsExp = trimString(baseInfo?.career?.yearsExp ?? parsedResume?.years_experience_general);
+  const linkedin = trimString(baseInfo?.links?.linkedin);
+  const company = trimString(baseInfo?.career?.currentCompany);
+  const title = trimString(baseInfo?.career?.jobTitle);
+  const yearsExp = trimString(baseInfo?.career?.yearsExp);
   const desiredSalary = trimString(baseInfo?.career?.desiredSalary);
   const school = trimString(baseInfo?.education?.school);
   const degree = trimString(baseInfo?.education?.degree);
@@ -909,49 +1203,78 @@ async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any
 
   const filled: { field: string; value: string; confidence?: number }[] = [];
   const targets = [
-    { key: 'full_name', match: /full\s*name/i, value: fullName },
-    { key: 'first', match: /first/i, value: baseInfo?.name?.first },
-    { key: 'last', match: /last/i, value: baseInfo?.name?.last },
-    { key: 'email', match: /email/i, value: email },
-    { key: 'phone_code', match: /(phone|mobile).*(code)|country\s*code|dial\s*code/i, value: phoneCode },
-    { key: 'phone_number', match: /(phone|mobile).*(number|no\.)/i, value: phoneNumber },
-    { key: 'phone', match: /phone|tel/i, value: phone },
-    { key: 'address', match: /address/i, value: address },
-    { key: 'city', match: /city/i, value: city },
-    { key: 'state', match: /state|province|region/i, value: state },
-    { key: 'country', match: /country|nation/i, value: country },
-    { key: 'postal_code', match: /postal|zip/i, value: postalCode },
-    { key: 'company', match: /company|employer/i, value: company },
-    { key: 'title', match: /title|position|role/i, value: title },
-    { key: 'years_experience', match: /years?.*experience|experience.*years|yrs/i, value: yearsExp },
-    { key: 'desired_salary', match: /salary|compensation|pay|rate/i, value: desiredSalary },
-    { key: 'linkedin', match: /linkedin|linked\s*in/i, value: linkedin },
-    { key: 'school', match: /school|university|college/i, value: school },
-    { key: 'degree', match: /degree|diploma/i, value: degree },
-    { key: 'major_field', match: /major|field\s*of\s*study/i, value: majorField },
-    { key: 'graduation_at', match: /grad/i, value: graduationAt },
+    { key: "full_name", match: /full\s*name/i, value: fullName },
+    { key: "first", match: /first/i, value: baseInfo?.name?.first },
+    { key: "last", match: /last/i, value: baseInfo?.name?.last },
+    { key: "email", match: /email/i, value: email },
+    {
+      key: "phone_code",
+      match: /(phone|mobile).*(code)|country\s*code|dial\s*code/i,
+      value: phoneCode,
+    },
+    {
+      key: "phone_number",
+      match: /(phone|mobile).*(number|no\.)/i,
+      value: phoneNumber,
+    },
+    { key: "phone", match: /phone|tel/i, value: phone },
+    { key: "address", match: /address/i, value: address },
+    { key: "city", match: /city/i, value: city },
+    { key: "state", match: /state|province|region/i, value: state },
+    { key: "country", match: /country|nation/i, value: country },
+    { key: "postal_code", match: /postal|zip/i, value: postalCode },
+    { key: "company", match: /company|employer/i, value: company },
+    { key: "title", match: /title|position|role/i, value: title },
+    {
+      key: "years_experience",
+      match: /years?.*experience|experience.*years|yrs/i,
+      value: yearsExp,
+    },
+    {
+      key: "desired_salary",
+      match: /salary|compensation|pay|rate/i,
+      value: desiredSalary,
+    },
+    { key: "linkedin", match: /linkedin|linked\s*in/i, value: linkedin },
+    { key: "school", match: /school|university|college/i, value: school },
+    { key: "degree", match: /degree|diploma/i, value: degree },
+    {
+      key: "major_field",
+      match: /major|field\s*of\s*study/i,
+      value: majorField,
+    },
+    { key: "graduation_at", match: /grad/i, value: graduationAt },
   ].filter((t) => t.value);
 
-  const inputs = await page.$$('input, textarea, select');
+  const inputs = await page.$$("input, textarea, select");
   for (const el of inputs) {
     const props = await el.evaluate((node) => {
-      const lbl = (node as HTMLInputElement).labels?.[0]?.innerText || '';
+      const lbl = (node as HTMLInputElement).labels?.[0]?.innerText || "";
       return {
         tag: node.tagName.toLowerCase(),
-        type: (node as HTMLInputElement).type || node.getAttribute('type') || 'text',
-        name: node.getAttribute('name') || '',
-        id: node.id || '',
-        placeholder: node.getAttribute('placeholder') || '',
+        type:
+          (node as HTMLInputElement).type ||
+          node.getAttribute("type") ||
+          "text",
+        name: node.getAttribute("name") || "",
+        id: node.id || "",
+        placeholder: node.getAttribute("placeholder") || "",
         label: lbl,
       };
     });
-    if (props.type === 'checkbox' || props.type === 'radio' || props.type === 'file') continue;
-    const haystack = `${props.label} ${props.name} ${props.id} ${props.placeholder}`.toLowerCase();
+    if (
+      props.type === "checkbox" ||
+      props.type === "radio" ||
+      props.type === "file"
+    )
+      continue;
+    const haystack =
+      `${props.label} ${props.name} ${props.id} ${props.placeholder}`.toLowerCase();
     const match = targets.find((t) => t.match.test(haystack));
     if (match) {
-      const val = String(match.value ?? '');
+      const val = String(match.value ?? "");
       try {
-        if (props.tag === 'select') {
+        if (props.tag === "select") {
           await el.selectOption({ label: val });
         } else {
           await el.fill(val);
@@ -966,86 +1289,159 @@ async function simplePageFill(page: Page, baseInfo: BaseInfo, parsedResume?: any
 }
 
 async function hydrateResume(resume: Resume, baseProfile?: BaseInfo) {
-  let resumeText = resume.resumeText ?? '';
+  let resumeText = resume.resumeText ?? "";
   if (!resumeText && resume.filePath) {
     const resolved = resolveResumePath(resume.filePath);
-    resumeText = await extractResumeTextFromFile(resolved, path.basename(resume.filePath));
+    resumeText = await extractResumeTextFromFile(
+      resolved,
+      path.basename(resume.filePath)
+    );
   }
   resumeText = sanitizeText(resumeText);
-  const parsedResume = await tryParseResumeText(resume.id, resumeText, baseProfile);
+  const parsedResume = await tryParseResumeText(
+    resume.id,
+    resumeText,
+    baseProfile
+  );
   return { ...resume, resumeText, parsedResume };
 }
 
 const DEFAULT_AUTOFILL_FIELDS = [
-  { field_id: 'first_name', label: 'First name', type: 'text', required: true },
-  { field_id: 'last_name', label: 'Last name', type: 'text', required: true },
-  { field_id: 'email', label: 'Email', type: 'text', required: true },
-  { field_id: 'phone_code', label: 'Phone code', type: 'text', required: false },
-  { field_id: 'phone_number', label: 'Phone number', type: 'text', required: false },
-  { field_id: 'phone', label: 'Phone', type: 'text', required: false },
-  { field_id: 'address', label: 'Address', type: 'text', required: false },
-  { field_id: 'city', label: 'City', type: 'text', required: false },
-  { field_id: 'state', label: 'State/Province', type: 'text', required: false },
-  { field_id: 'country', label: 'Country', type: 'text', required: false },
-  { field_id: 'postal_code', label: 'Postal code', type: 'text', required: false },
-  { field_id: 'linkedin', label: 'LinkedIn', type: 'text', required: false },
-  { field_id: 'job_title', label: 'Job title', type: 'text', required: false },
-  { field_id: 'current_company', label: 'Current company', type: 'text', required: false },
-  { field_id: 'years_exp', label: 'Years of experience', type: 'number', required: false },
-  { field_id: 'desired_salary', label: 'Desired salary', type: 'text', required: false },
-  { field_id: 'school', label: 'School', type: 'text', required: false },
-  { field_id: 'degree', label: 'Degree', type: 'text', required: false },
-  { field_id: 'major_field', label: 'Major/Field', type: 'text', required: false },
-  { field_id: 'graduation_at', label: 'Graduation date', type: 'text', required: false },
-  { field_id: 'work_auth', label: 'Authorized to work?', type: 'checkbox', required: false },
+  { field_id: "first_name", label: "First name", type: "text", required: true },
+  { field_id: "last_name", label: "Last name", type: "text", required: true },
+  { field_id: "email", label: "Email", type: "text", required: true },
+  {
+    field_id: "phone_code",
+    label: "Phone code",
+    type: "text",
+    required: false,
+  },
+  {
+    field_id: "phone_number",
+    label: "Phone number",
+    type: "text",
+    required: false,
+  },
+  { field_id: "phone", label: "Phone", type: "text", required: false },
+  { field_id: "address", label: "Address", type: "text", required: false },
+  { field_id: "city", label: "City", type: "text", required: false },
+  { field_id: "state", label: "State/Province", type: "text", required: false },
+  { field_id: "country", label: "Country", type: "text", required: false },
+  {
+    field_id: "postal_code",
+    label: "Postal code",
+    type: "text",
+    required: false,
+  },
+  { field_id: "linkedin", label: "LinkedIn", type: "text", required: false },
+  { field_id: "job_title", label: "Job title", type: "text", required: false },
+  {
+    field_id: "current_company",
+    label: "Current company",
+    type: "text",
+    required: false,
+  },
+  {
+    field_id: "years_exp",
+    label: "Years of experience",
+    type: "number",
+    required: false,
+  },
+  {
+    field_id: "desired_salary",
+    label: "Desired salary",
+    type: "text",
+    required: false,
+  },
+  { field_id: "school", label: "School", type: "text", required: false },
+  { field_id: "degree", label: "Degree", type: "text", required: false },
+  {
+    field_id: "major_field",
+    label: "Major/Field",
+    type: "text",
+    required: false,
+  },
+  {
+    field_id: "graduation_at",
+    label: "Graduation date",
+    type: "text",
+    required: false,
+  },
+  {
+    field_id: "work_auth",
+    label: "Authorized to work?",
+    type: "checkbox",
+    required: false,
+  },
 ];
 
 // initDb, auth guard, signToken live in dedicated modules
 
 async function bootstrap() {
   await app.register(authGuard);
-  await app.register(cors, { origin: true });
+  await app.register(cors, { origin: config.CORS_ORIGINS, credentials: true });
   await app.register(websocket);
+  await app.register(multipart, {
+    limits: {
+      fileSize: 10 * 1024 * 1024, // 10MB
+    },
+  });
   await initDb();
   await fs.mkdir(RESUME_DIR, { recursive: true });
 
-  app.get('/health', async () => ({ status: 'ok' }));
+  app.get("/health", async () => ({ status: "ok" }));
 
-  app.get('/sessions/:id/top-resumes', async (request, reply) => {
+  app.get("/sessions/:id/top-resumes", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
     const session = sessions.find((s) => s.id === id);
-    if (!session) return reply.status(404).send({ message: 'Session not found' });
+    if (!session)
+      return reply.status(404).send({ message: "Session not found" });
 
-    const jdText = String((session.jobContext as any)?.job_description_text ?? '').trim();
+    const jdText = String(
+      (session.jobContext as any)?.job_description_text ?? ""
+    ).trim();
     if (!jdText) {
-      return reply.status(400).send({ message: 'Job description missing for this session' });
+      return reply
+        .status(400)
+        .send({ message: "Job description missing for this session" });
     }
 
     try {
-      const top = await getTopMatchedResumesFromSession(session, jdText, request.log);
+      const top = await getTopMatchedResumesFromSession(
+        session,
+        jdText,
+        request.log
+      );
       return top;
     } catch (err) {
-      request.log.error({ err }, 'failed to score resumes');
-      return reply.status(500).send({ message: 'Failed to score resumes' });
+      request.log.error({ err }, "failed to score resumes");
+      return reply.status(500).send({ message: "Failed to score resumes" });
     }
   });
 
-  app.post('/auth/login', async (request, reply) => {
-    const schema = z.object({ email: z.string().email(), password: z.string().optional() });
+  app.post("/auth/login", async (request, reply) => {
+    const schema = z.object({
+      email: z.string().email(),
+      password: z.string().optional(),
+    });
     const body = schema.parse(request.body);
     const user = await findUserByEmail(body.email);
     if (!user) {
-      return reply.status(401).send({ message: 'Invalid credentials' });
+      return reply.status(401).send({ message: "Invalid credentials" });
     }
-    if (user.password && body.password && !(await bcrypt.compare(body.password, user.password))) {
-      return reply.status(401).send({ message: 'Invalid credentials' });
+    if (
+      user.password &&
+      body.password &&
+      !(await bcrypt.compare(body.password, user.password))
+    ) {
+      return reply.status(401).send({ message: "Invalid credentials" });
     }
     const token = signToken(user);
     return { token, user };
   });
 
-  app.post('/auth/signup', async (request, reply) => {
+  app.post("/auth/signup", async (request, reply) => {
     const schema = z.object({
       email: z.string().email(),
       password: z.string().min(3),
@@ -1054,13 +1450,13 @@ async function bootstrap() {
     const body = schema.parse(request.body);
     const exists = await findUserByEmail(body.email);
     if (exists) {
-      return reply.status(409).send({ message: 'Email already registered' });
+      return reply.status(409).send({ message: "Email already registered" });
     }
     const hashed = await bcrypt.hash(body.password, 8);
     const user: User = {
       id: randomUUID(),
       email: body.email,
-      role: 'OBSERVER',
+      role: "OBSERVER",
       name: body.name,
       isActive: true,
       password: hashed,
@@ -1070,37 +1466,39 @@ async function bootstrap() {
     return { token, user };
   });
 
-  app.get('/profiles', async (request, reply) => {
+  app.get("/profiles", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
     if (!actor || actor.isActive === false) {
-      return reply.status(401).send({ message: 'Unauthorized' });
+      return reply.status(401).send({ message: "Unauthorized" });
     }
 
     const { userId } = request.query as { userId?: string };
 
-    if (actor.role === 'ADMIN' || actor.role === 'MANAGER') {
+    if (actor.role === "ADMIN" || actor.role === "MANAGER") {
       if (userId) {
         const target = await findUserById(userId);
-        if (target?.role === 'BIDDER' && target.isActive !== false) {
+        if (target?.role === "BIDDER" && target.isActive !== false) {
           return listProfilesForBidder(target.id);
         }
       }
       return listProfiles();
     }
 
-    if (actor.role === 'BIDDER') {
+    if (actor.role === "BIDDER") {
       return listProfilesForBidder(actor.id);
     }
 
-    return reply.status(403).send({ message: 'Forbidden' });
+    return reply.status(403).send({ message: "Forbidden" });
   });
 
-  app.post('/profiles', async (request, reply) => {
+  app.post("/profiles", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
-      return reply.status(403).send({ message: 'Only managers or admins can create profiles' });
+    if (!actor || (actor.role !== "MANAGER" && actor.role !== "ADMIN")) {
+      return reply
+        .status(403)
+        .send({ message: "Only managers or admins can create profiles" });
     }
     const schema = z.object({
       displayName: z.string().min(2),
@@ -1129,43 +1527,65 @@ async function bootstrap() {
     const profileId = randomUUID();
     const now = new Date().toISOString();
     const incomingBase = (body.baseInfo ?? {}) as BaseInfo;
-    const baseInfo = mergeBaseInfo({}, {
-      ...incomingBase,
-      name: {
-        ...(incomingBase.name ?? {}),
-        first: trimString(body.firstName ?? incomingBase.name?.first),
-        last: trimString(body.lastName ?? incomingBase.name?.last),
-      },
-      contact: {
-        ...(incomingBase.contact ?? {}),
-        email: trimString(body.email ?? incomingBase.contact?.email),
-        phoneCode: trimString(body.phoneCode ?? incomingBase.contact?.phoneCode),
-        phoneNumber: trimString(body.phoneNumber ?? incomingBase.contact?.phoneNumber),
-      },
-      location: {
-        ...(incomingBase.location ?? {}),
-        address: trimString(body.address ?? incomingBase.location?.address),
-        city: trimString(body.city ?? incomingBase.location?.city),
-        state: trimString(body.state ?? incomingBase.location?.state),
-        country: trimString(body.country ?? incomingBase.location?.country),
-        postalCode: trimString(body.postalCode ?? incomingBase.location?.postalCode),
-      },
-      links: { ...(incomingBase.links ?? {}), linkedin: trimString(body.linkedin ?? (incomingBase.links as any)?.linkedin) },
-      career: {
-        ...(incomingBase.career ?? {}),
-        jobTitle: trimString(body.jobTitle ?? incomingBase.career?.jobTitle),
-        currentCompany: trimString(body.currentCompany ?? incomingBase.career?.currentCompany),
-        yearsExp: body.yearsExp ?? incomingBase.career?.yearsExp,
-        desiredSalary: trimString(body.desiredSalary ?? incomingBase.career?.desiredSalary),
-      },
-      education: {
-        ...(incomingBase.education ?? {}),
-        school: trimString(body.school ?? incomingBase.education?.school),
-        degree: trimString(body.degree ?? incomingBase.education?.degree),
-        majorField: trimString(body.majorField ?? incomingBase.education?.majorField),
-        graduationAt: trimString(body.graduationAt ?? incomingBase.education?.graduationAt),
-      },
-    });
+    const baseInfo = mergeBaseInfo(
+      {},
+      {
+        ...incomingBase,
+        name: {
+          ...(incomingBase.name ?? {}),
+          first: trimString(body.firstName ?? incomingBase.name?.first),
+          last: trimString(body.lastName ?? incomingBase.name?.last),
+        },
+        contact: {
+          ...(incomingBase.contact ?? {}),
+          email: trimString(body.email ?? incomingBase.contact?.email),
+          phoneCode: trimString(
+            body.phoneCode ?? incomingBase.contact?.phoneCode
+          ),
+          phoneNumber: trimString(
+            body.phoneNumber ?? incomingBase.contact?.phoneNumber
+          ),
+        },
+        location: {
+          ...(incomingBase.location ?? {}),
+          address: trimString(body.address ?? incomingBase.location?.address),
+          city: trimString(body.city ?? incomingBase.location?.city),
+          state: trimString(body.state ?? incomingBase.location?.state),
+          country: trimString(body.country ?? incomingBase.location?.country),
+          postalCode: trimString(
+            body.postalCode ?? incomingBase.location?.postalCode
+          ),
+        },
+        links: {
+          ...(incomingBase.links ?? {}),
+          linkedin: trimString(
+            body.linkedin ?? (incomingBase.links as any)?.linkedin
+          ),
+        },
+        career: {
+          ...(incomingBase.career ?? {}),
+          jobTitle: trimString(body.jobTitle ?? incomingBase.career?.jobTitle),
+          currentCompany: trimString(
+            body.currentCompany ?? incomingBase.career?.currentCompany
+          ),
+          yearsExp: body.yearsExp ?? incomingBase.career?.yearsExp,
+          desiredSalary: trimString(
+            body.desiredSalary ?? incomingBase.career?.desiredSalary
+          ),
+        },
+        education: {
+          ...(incomingBase.education ?? {}),
+          school: trimString(body.school ?? incomingBase.education?.school),
+          degree: trimString(body.degree ?? incomingBase.education?.degree),
+          majorField: trimString(
+            body.majorField ?? incomingBase.education?.majorField
+          ),
+          graduationAt: trimString(
+            body.graduationAt ?? incomingBase.education?.graduationAt
+          ),
+        },
+      }
+    );
     const profile = {
       id: profileId,
       displayName: body.displayName,
@@ -1178,15 +1598,18 @@ async function bootstrap() {
     return profile;
   });
 
-  app.patch('/profiles/:id', async (request, reply) => {
+  app.patch("/profiles/:id", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
-      return reply.status(403).send({ message: 'Only managers or admins can update profiles' });
+    if (!actor || (actor.role !== "MANAGER" && actor.role !== "ADMIN")) {
+      return reply
+        .status(403)
+        .send({ message: "Only managers or admins can update profiles" });
     }
     const { id } = request.params as { id: string };
     const existing = await findProfileById(id);
-    if (!existing) return reply.status(404).send({ message: 'Profile not found' });
+    if (!existing)
+      return reply.status(404).send({ message: "Profile not found" });
 
     const schema = z.object({
       displayName: z.string().min(2).optional(),
@@ -1212,23 +1635,27 @@ async function bootstrap() {
     return updatedProfile;
   });
 
-  app.get('/profiles/:id/resumes', async (request, reply) => {
+  app.get("/profiles/:id/resumes", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
     const profile = await findProfileById(id);
-    if (!profile) return reply.status(404).send({ message: 'Profile not found' });
+    if (!profile)
+      return reply.status(404).send({ message: "Profile not found" });
     return listResumesByProfile(id);
   });
 
-  app.post('/profiles/:id/resumes', async (request, reply) => {
+  app.post("/profiles/:id/resumes", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
-      return reply.status(403).send({ message: 'Only managers or admins can add resumes' });
+    if (!actor || (actor.role !== "MANAGER" && actor.role !== "ADMIN")) {
+      return reply
+        .status(403)
+        .send({ message: "Only managers or admins can add resumes" });
     }
     const { id } = request.params as { id: string };
     const profile = await findProfileById(id);
-    if (!profile) return reply.status(404).send({ message: 'Profile not found' });
+    if (!profile)
+      return reply.status(404).send({ message: "Profile not found" });
 
     const schema = z.object({
       label: z.string().optional(),
@@ -1240,23 +1667,27 @@ async function bootstrap() {
     const body = schema.parse(request.body ?? {});
     const baseLabel =
       body.label?.trim() ||
-      (body.fileName ? body.fileName.replace(/\.[^/.]+$/, '').trim() : '') ||
-      '';
+      (body.fileName ? body.fileName.replace(/\.[^/.]+$/, "").trim() : "") ||
+      "";
     if (baseLabel.length < 2) {
-      return reply.status(400).send({ message: 'Label is required (min 2 chars)' });
+      return reply
+        .status(400)
+        .send({ message: "Label is required (min 2 chars)" });
     }
     if (!body.fileData && !body.filePath) {
-      return reply.status(400).send({ message: 'Resume file is required' });
+      return reply.status(400).send({ message: "Resume file is required" });
     }
     const resumeId = randomUUID();
-    let filePath = body.filePath ?? '';
-    let resumeText = '';
+    let filePath = body.filePath ?? "";
+    let resumeText = "";
     let resumeJson: Record<string, unknown> | undefined;
-    let resolvedPath = '';
+    let resolvedPath = "";
     if (body.fileData) {
-      const buffer = Buffer.from(body.fileData, 'base64');
+      const buffer = Buffer.from(body.fileData, "base64");
       const ext =
-        body.fileName && path.extname(body.fileName) ? path.extname(body.fileName) : '.pdf';
+        body.fileName && path.extname(body.fileName)
+          ? path.extname(body.fileName)
+          : ".pdf";
       const fileName = `${resumeId}${ext}`;
       const targetPath = path.join(RESUME_DIR, fileName);
       await fs.writeFile(targetPath, buffer);
@@ -1267,8 +1698,15 @@ async function bootstrap() {
     }
 
     if (resolvedPath) {
-      resumeText = await extractResumeTextFromFile(resolvedPath, body.fileName ?? path.basename(resolvedPath));
-      resumeJson = await tryParseResumeText(resumeId, resumeText, profile.baseInfo);
+      resumeText = await extractResumeTextFromFile(
+        resolvedPath,
+        body.fileName ?? path.basename(resolvedPath)
+      );
+      resumeJson = await tryParseResumeText(
+        resumeId,
+        resumeText,
+        profile.baseInfo
+      );
     }
     resumeText = sanitizeText(resumeText);
     const resumeDescription = body.description?.trim() || undefined;
@@ -1286,36 +1724,45 @@ async function bootstrap() {
     return { ...resume, resumeJson };
   });
 
-  app.delete('/profiles/:profileId/resumes/:resumeId', async (request, reply) => {
-    if (forbidObserver(reply, request.authUser)) return;
-    const actor = request.authUser;
-    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
-      return reply.status(403).send({ message: 'Only managers or admins can remove resumes' });
-    }
-    const { profileId, resumeId } = request.params as { profileId: string; resumeId: string };
-    const profile = await findProfileById(profileId);
-    if (!profile) return reply.status(404).send({ message: 'Profile not found' });
-    const resume = await findResumeById(resumeId);
-    if (!resume || resume.profileId !== profileId) {
-      return reply.status(404).send({ message: 'Resume not found' });
-    }
-    if (resume.filePath) {
-      try {
-        const resolved = resolveResumePath(resume.filePath);
-        if (resolved) await fs.unlink(resolved);
-      } catch {
-        // ignore missing files
+  app.delete(
+    "/profiles/:profileId/resumes/:resumeId",
+    async (request, reply) => {
+      if (forbidObserver(reply, request.authUser)) return;
+      const actor = request.authUser;
+      if (!actor || (actor.role !== "MANAGER" && actor.role !== "ADMIN")) {
+        return reply
+          .status(403)
+          .send({ message: "Only managers or admins can remove resumes" });
       }
+      const { profileId, resumeId } = request.params as {
+        profileId: string;
+        resumeId: string;
+      };
+      const profile = await findProfileById(profileId);
+      if (!profile)
+        return reply.status(404).send({ message: "Profile not found" });
+      const resume = await findResumeById(resumeId);
+      if (!resume || resume.profileId !== profileId) {
+        return reply.status(404).send({ message: "Resume not found" });
+      }
+      if (resume.filePath) {
+        try {
+          const resolved = resolveResumePath(resume.filePath);
+          if (resolved) await fs.unlink(resolved);
+        } catch {
+          // ignore missing files
+        }
+      }
+      await deleteResumeById(resumeId);
+      return { ok: true };
     }
-    await deleteResumeById(resumeId);
-    return { ok: true };
-  });
+  );
 
-  app.get('/calendar/accounts', async (request, reply) => {
+  app.get("/calendar/accounts", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
     if (!actor) {
-      return reply.status(401).send({ message: 'Unauthorized' });
+      return reply.status(401).send({ message: "Unauthorized" });
     }
     const parsed = z
       .object({
@@ -1323,42 +1770,44 @@ async function bootstrap() {
       })
       .safeParse(request.query);
     if (!parsed.success) {
-      return reply.status(400).send({ message: 'Invalid query' });
+      return reply.status(400).send({ message: "Invalid query" });
     }
     return listProfileAccountsForUser(actor, parsed.data.profileId);
   });
 
-  app.post('/calendar/accounts', async (request, reply) => {
+  app.post("/calendar/accounts", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
     if (!actor) {
-      return reply.status(401).send({ message: 'Unauthorized' });
+      return reply.status(401).send({ message: "Unauthorized" });
     }
     const schema = z.object({
       profileId: z.string().uuid(),
       email: z.string().email(),
-      provider: z.enum(['MICROSOFT', 'GOOGLE']).default('MICROSOFT').optional(),
+      provider: z.enum(["MICROSOFT", "GOOGLE"]).default("MICROSOFT").optional(),
       displayName: z.string().min(1).optional(),
       timezone: z.string().min(2).optional(),
     });
     const body = schema.parse(request.body ?? {});
     const profile = await findProfileById(body.profileId);
     if (!profile) {
-      return reply.status(404).send({ message: 'Profile not found' });
+      return reply.status(404).send({ message: "Profile not found" });
     }
-    const isManager = actor.role === 'ADMIN' || actor.role === 'MANAGER';
+    const isManager = actor.role === "ADMIN" || actor.role === "MANAGER";
     const isAssignedBidder = profile.assignedBidderId === actor.id;
     if (!isManager && !isAssignedBidder) {
-      return reply.status(403).send({ message: 'Not allowed to manage accounts for this profile' });
+      return reply
+        .status(403)
+        .send({ message: "Not allowed to manage accounts for this profile" });
     }
     const account = await upsertProfileAccount({
       id: randomUUID(),
       profileId: body.profileId,
-      provider: body.provider ?? 'MICROSOFT',
+      provider: body.provider ?? "MICROSOFT",
       email: body.email.toLowerCase(),
       displayName: body.displayName ?? body.email,
-      timezone: body.timezone ?? 'UTC',
-      status: 'ACTIVE',
+      timezone: body.timezone ?? "UTC",
+      status: "ACTIVE",
     });
     return account;
   });
@@ -1455,27 +1904,33 @@ async function bootstrap() {
       })
       .safeParse(request.query);
     if (!parsed.success) {
-      return reply.status(400).send({ message: 'Invalid query' });
+      return reply.status(400).send({ message: "Invalid query" });
     }
     const { accountId, start, end } = parsed.data;
     const account = await findProfileAccountById(accountId);
     if (!account) {
-      return reply.status(404).send({ message: 'Calendar account not found' });
+      return reply.status(404).send({ message: "Calendar account not found" });
     }
-    const isManager = actor.role === 'ADMIN' || actor.role === 'MANAGER';
+    const isManager = actor.role === "ADMIN" || actor.role === "MANAGER";
     const isAssignedBidder = account.profileAssignedBidderId === actor.id;
     if (!isManager && !isAssignedBidder) {
-      return reply.status(403).send({ message: 'Not allowed to view this calendar' });
+      return reply
+        .status(403)
+        .send({ message: "Not allowed to view this calendar" });
     }
     const startDate = new Date(start);
     const endDate = new Date(end);
     if (Number.isNaN(startDate.getTime()) || Number.isNaN(endDate.getTime())) {
-      return reply.status(400).send({ message: 'Invalid date range' });
+      return reply.status(400).send({ message: "Invalid date range" });
     }
     if (endDate <= startDate) {
-      return reply.status(400).send({ message: 'End must be after start' });
+      return reply.status(400).send({ message: "End must be after start" });
     }
-    const { events: calendarEvents, source, warning } = await loadOutlookEvents({
+    const {
+      events: calendarEvents,
+      source,
+      warning,
+    } = await loadOutlookEvents({
       email: account.email,
       rangeStart: start,
       rangeEnd: end,
@@ -1497,33 +1952,38 @@ async function bootstrap() {
     };
   });
 
-  app.get('/resumes/:id/file', async (request, reply) => {
+  app.get("/resumes/:id/file", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
-      return reply.status(403).send({ message: 'Only managers or admins can view resumes' });
+    if (!actor || (actor.role !== "MANAGER" && actor.role !== "ADMIN")) {
+      return reply
+        .status(403)
+        .send({ message: "Only managers or admins can view resumes" });
     }
     const { id } = request.params as { id: string };
     const resume = await findResumeById(id);
-    if (!resume || !resume.filePath) return reply.status(404).send({ message: 'Resume not found' });
+    if (!resume || !resume.filePath)
+      return reply.status(404).send({ message: "Resume not found" });
     const resolvedPath = resolveResumePath(resume.filePath);
     if (!resolvedPath || !fsSync.existsSync(resolvedPath)) {
-      return reply.status(404).send({ message: 'File missing' });
+      return reply.status(404).send({ message: "File missing" });
     }
-    reply.header('Content-Type', 'application/pdf');
+    reply.header("Content-Type", "application/pdf");
     const stream = fsSync.createReadStream(resolvedPath);
     return reply.send(stream);
   });
 
-  app.get('/assignments', async (request, reply) => {
+  app.get("/assignments", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     return listAssignments();
   });
-  app.post('/assignments', async (request, reply) => {
+  app.post("/assignments", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
-      return reply.status(403).send({ message: 'Only managers or admins can assign profiles' });
+    if (!actor || (actor.role !== "MANAGER" && actor.role !== "ADMIN")) {
+      return reply
+        .status(403)
+        .send({ message: "Only managers or admins can assign profiles" });
     }
     const schema = z.object({
       profileId: z.string(),
@@ -1533,15 +1993,16 @@ async function bootstrap() {
     const body = schema.parse(request.body);
     const profile = await findProfileById(body.profileId);
     const bidder = await findUserById(body.bidderUserId);
-    if (!profile || !bidder || bidder.role !== 'BIDDER') {
-      return reply.status(400).send({ message: 'Invalid profile or bidder' });
+    if (!profile || !bidder || bidder.role !== "BIDDER") {
+      return reply.status(400).send({ message: "Invalid profile or bidder" });
     }
 
     const existing = await findActiveAssignmentByProfile(body.profileId);
     if (existing) {
-      return reply
-        .status(409)
-        .send({ message: 'Profile already assigned', assignmentId: existing.id });
+      return reply.status(409).send({
+        message: "Profile already assigned",
+        assignmentId: existing.id,
+      });
     }
 
     const newAssignment: Assignment = {
@@ -1555,42 +2016,311 @@ async function bootstrap() {
     await insertAssignmentRecord(newAssignment);
     events.push({
       id: randomUUID(),
-      sessionId: 'admin-event',
-      eventType: 'ASSIGNED',
+      sessionId: "admin-event",
+      eventType: "ASSIGNED",
       payload: { profileId: body.profileId, bidderUserId: body.bidderUserId },
       createdAt: new Date().toISOString(),
     });
     return newAssignment;
   });
 
-  app.post('/assignments/:id/unassign', async (request, reply) => {
+  app.post("/assignments/:id/unassign", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
     const assignment = await closeAssignmentById(id);
-    if (!assignment) return reply.status(404).send({ message: 'Assignment not found' });
+    if (!assignment)
+      return reply.status(404).send({ message: "Assignment not found" });
     events.push({
       id: randomUUID(),
-      sessionId: 'admin-event',
-      eventType: 'UNASSIGNED',
-      payload: { profileId: assignment.profileId, bidderUserId: assignment.bidderUserId },
+      sessionId: "admin-event",
+      eventType: "UNASSIGNED",
+      payload: {
+        profileId: assignment.profileId,
+        bidderUserId: assignment.bidderUserId,
+      },
       createdAt: new Date().toISOString(),
     });
     return assignment;
   });
 
-  app.get('/sessions/:id', async (request, reply) => {
+  const ensureCommunityThreadAccess = async (
+    threadId: string,
+    actor: User,
+    reply: any
+  ) => {
+    const thread = await findCommunityThreadById(threadId);
+    if (!thread) {
+      reply.status(404).send({ message: "Thread not found" });
+      return undefined;
+    }
+    if (thread.threadType === "DM" || thread.isPrivate) {
+      const isMember = await isCommunityThreadMember(threadId, actor.id);
+      if (!isMember) {
+        reply.status(403).send({ message: "Not a member of this thread" });
+        return undefined;
+      }
+    }
+    return thread;
+  };
+
+  app.get("/community/overview", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const [channels, dms] = await Promise.all([
+      listCommunityChannels(),
+      listCommunityDmThreads(actor.id),
+    ]);
+    return { channels, dms };
+  });
+
+  app.post("/community/channels", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const schema = z.object({
+      name: z.string(),
+      description: z.string().optional(),
+    });
+    const body = schema.parse(request.body);
+    const name = normalizeChannelName(body.name);
+    if (!name)
+      return reply.status(400).send({ message: "Channel name required" });
+    const nameKey = name.toLowerCase();
+    const existing = await findCommunityChannelByKey(nameKey);
+    if (existing) {
+      return reply
+        .status(409)
+        .send({ message: "Channel already exists", channel: existing });
+    }
+    const created = await insertCommunityThread({
+      id: randomUUID(),
+      threadType: "CHANNEL",
+      name,
+      nameKey,
+      description: body.description?.trim() || null,
+      createdBy: actor.id,
+      isPrivate: false,
+    });
+    await insertCommunityThreadMember({
+      id: randomUUID(),
+      threadId: created.id,
+      userId: actor.id,
+      role: "OWNER",
+    });
+    return created;
+  });
+
+  app.post("/community/dms", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const schema = z.object({ userId: z.string() });
+    const body = schema.parse(request.body);
+    if (body.userId === actor.id) {
+      return reply
+        .status(400)
+        .send({ message: "Cannot start a DM with yourself" });
+    }
+    const other = await findUserById(body.userId);
+    if (!other || other.isActive === false) {
+      return reply.status(404).send({ message: "User not found" });
+    }
+    const existingId = await findCommunityDmThreadId(actor.id, body.userId);
+    if (existingId) {
+      const summary = await getCommunityDmThreadSummary(existingId, actor.id);
+      if (summary) return summary;
+      return {
+        id: existingId,
+        threadType: "DM",
+        isPrivate: true,
+        createdAt: new Date().toISOString(),
+        participants: [{ id: other.id, name: other.name, email: other.email }],
+      };
+    }
+    const thread = await insertCommunityThread({
+      id: randomUUID(),
+      threadType: "DM",
+      name: null,
+      nameKey: null,
+      description: null,
+      createdBy: actor.id,
+      isPrivate: true,
+    });
+    await insertCommunityThreadMember({
+      id: randomUUID(),
+      threadId: thread.id,
+      userId: actor.id,
+      role: "MEMBER",
+    });
+    await insertCommunityThreadMember({
+      id: randomUUID(),
+      threadId: thread.id,
+      userId: other.id,
+      role: "MEMBER",
+    });
+    const summary = await getCommunityDmThreadSummary(thread.id, actor.id);
+    return (
+      summary ?? {
+        id: thread.id,
+        threadType: "DM",
+        isPrivate: true,
+        createdAt: thread.createdAt,
+        participants: [{ id: other.id, name: other.name, email: other.email }],
+      }
+    );
+  });
+
+  app.get("/community/threads/:id/messages", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const { id } = request.params as { id: string };
+    const query = request.query as {
+      limit?: string;
+      before?: string;
+      after?: string;
+    };
+    const thread = await ensureCommunityThreadAccess(id, actor, reply);
+    if (!thread) return;
+
+    const limit = query.limit ? parseInt(query.limit, 10) : 50;
+    const messages = await listCommunityMessagesWithPagination(id, {
+      limit,
+      before: query.before,
+      after: query.after,
+    });
+
+    const enriched = await Promise.all(
+      messages.map(async (msg) => {
+        const attachments = await listMessageAttachments(msg.id);
+        const reactions = await listMessageReactions(msg.id, actor.id);
+        let replyPreview = null;
+
+        if (msg.replyToMessageId) {
+          const target = await getMessageById(msg.replyToMessageId);
+          if (target && !target.isDeleted) {
+            replyPreview = {
+              id: target.id,
+              senderId: target.senderId,
+              senderName: target.senderName ?? null,
+              body: target.body.substring(0, 100),
+            };
+          }
+        }
+
+        return {
+          ...msg,
+          attachments,
+          reactions,
+          replyPreview,
+        };
+      })
+    );
+
+    if (messages.length > 0) {
+      await markThreadAsRead(id, actor.id, messages[messages.length - 1].id);
+    }
+
+    return enriched;
+  });
+
+  app.post("/community/threads/:id/messages", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const { id } = request.params as { id: string };
+    const schema = z.object({
+      body: z.string(),
+      replyToMessageId: z.string().optional(),
+      attachments: z
+        .array(
+          z.object({
+            fileName: z.string(),
+            fileUrl: z.string(),
+            fileSize: z.number(),
+            mimeType: z.string(),
+            thumbnailUrl: z.string().optional(),
+            width: z.number().optional(),
+            height: z.number().optional(),
+          })
+        )
+        .optional(),
+    });
+    const body = schema.parse(request.body);
+    const text = body.body.trim();
+    if (!text && (!body.attachments || body.attachments.length === 0))
+      return reply.status(400).send({ message: "Message body or attachments required" });
+    const thread = await ensureCommunityThreadAccess(id, actor, reply);
+    if (!thread) return;
+
+    if (body.replyToMessageId) {
+      const replyTarget = await getMessageById(body.replyToMessageId);
+      if (!replyTarget || replyTarget.threadId !== id) {
+        return reply.status(400).send({ message: "Invalid reply target" });
+      }
+    }
+
+    if (thread.threadType === "CHANNEL") {
+      await insertCommunityThreadMember({
+        id: randomUUID(),
+        threadId: id,
+        userId: actor.id,
+        role: "MEMBER",
+      });
+    }
+    const message = await insertCommunityMessage({
+      id: randomUUID(),
+      threadId: id,
+      senderId: actor.id,
+      body: text || '',
+      replyToMessageId: body.replyToMessageId ?? null,
+      isEdited: false,
+      isDeleted: false,
+      createdAt: new Date().toISOString(),
+    });
+
+    if (body.attachments && body.attachments.length > 0) {
+      for (const att of body.attachments) {
+        await insertMessageAttachment({
+          id: randomUUID(),
+          messageId: message.id,
+          fileName: att.fileName,
+          fileUrl: att.fileUrl,
+          fileSize: att.fileSize,
+          mimeType: att.mimeType,
+          thumbnailUrl: att.thumbnailUrl ?? null,
+          width: att.width ?? null,
+          height: att.height ?? null,
+          createdAt: new Date().toISOString(),
+        });
+      }
+    }
+
+    await incrementUnreadCount(id, actor.id);
+
+    try {
+      await broadcastCommunityMessage(id, message);
+    } catch (err) {
+      request.log.error({ err }, "community realtime broadcast failed");
+    }
+    return message;
+  });
+
+  app.get("/sessions/:id", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
     const session = sessions.find((s) => s.id === id);
-    if (!session) return reply.status(404).send({ message: 'Session not found' });
+    if (!session)
+      return reply.status(404).send({ message: "Session not found" });
     return session;
   });
 
-  app.post('/sessions', async (request, reply) => {
+  app.post("/sessions", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
     if (!actor || actor.isActive === false) {
-      return reply.status(401).send({ message: 'Unauthorized' });
+      return reply.status(401).send({ message: "Unauthorized" });
     }
     const schema = z.object({
       bidderUserId: z.string(),
@@ -1599,19 +2329,24 @@ async function bootstrap() {
       selectedResumeId: z.string().optional(),
     });
     const body = schema.parse(request.body);
-    const profileAssignment = await findActiveAssignmentByProfile(body.profileId);
+    const profileAssignment = await findActiveAssignmentByProfile(
+      body.profileId
+    );
 
     let bidderUserId = body.bidderUserId;
-    if (actor.role === 'BIDDER') {
+    if (actor.role === "BIDDER") {
       bidderUserId = actor.id;
       if (profileAssignment && profileAssignment.bidderUserId !== actor.id) {
-        return reply.status(403).send({ message: 'Profile not assigned to bidder' });
+        return reply
+          .status(403)
+          .send({ message: "Profile not assigned to bidder" });
       }
-    } else if (actor.role === 'MANAGER' || actor.role === 'ADMIN') {
-      if (!bidderUserId && profileAssignment) bidderUserId = profileAssignment.bidderUserId;
+    } else if (actor.role === "MANAGER" || actor.role === "ADMIN") {
+      if (!bidderUserId && profileAssignment)
+        bidderUserId = profileAssignment.bidderUserId;
       if (!bidderUserId) bidderUserId = actor.id;
     } else {
-      return reply.status(403).send({ message: 'Forbidden' });
+      return reply.status(403).send({ message: "Forbidden" });
     }
 
     const session: ApplicationSession = {
@@ -1620,7 +2355,7 @@ async function bootstrap() {
       profileId: body.profileId,
       url: body.url,
       domain: tryExtractDomain(body.url),
-      status: 'OPEN',
+      status: "OPEN",
       selectedResumeId: body.selectedResumeId,
       startedAt: new Date().toISOString(),
     };
@@ -1628,68 +2363,75 @@ async function bootstrap() {
     events.push({
       id: randomUUID(),
       sessionId: session.id,
-      eventType: 'SESSION_CREATED',
+      eventType: "SESSION_CREATED",
       payload: { url: session.url },
       createdAt: new Date().toISOString(),
     });
     return session;
   });
 
-  app.post('/sessions/:id/go', async (request, reply) => {
+  app.post("/sessions/:id/go", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
     const session = sessions.find((s) => s.id === id);
-    if (!session) return reply.status(404).send({ message: 'Session not found' });
-    session.status = 'OPEN';
+    if (!session)
+      return reply.status(404).send({ message: "Session not found" });
+    session.status = "OPEN";
     try {
       await startBrowserSession(session);
     } catch (err) {
-      app.log.error({ err }, 'failed to start browser session');
+      app.log.error({ err }, "failed to start browser session");
     }
     events.push({
       id: randomUUID(),
       sessionId: id,
-      eventType: 'GO_CLICKED',
+      eventType: "GO_CLICKED",
       payload: { url: session.url },
       createdAt: new Date().toISOString(),
     });
     return { ok: true };
   });
 
-  app.post('/sessions/:id/analyze', async (request, reply) => {
+  app.post("/sessions/:id/analyze", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
     const session = sessions.find((s) => s.id === id);
-    if (!session) return reply.status(404).send({ message: 'Session not found' });
+    if (!session)
+      return reply.status(404).send({ message: "Session not found" });
     const body = (request.body as { useAi?: boolean } | undefined) ?? {};
     const useAi = Boolean(body.useAi);
 
     const live = livePages.get(id);
     const page = live?.page;
     if (!page) {
-      return reply.status(400).send({ message: 'Live page not available. Click Go and load the page before Analyze.' });
+      return reply.status(400).send({
+        message:
+          "Live page not available. Click Go and load the page before Analyze.",
+      });
     }
 
-    let pageHtml = '';
-    let pageTitle = '';
+    let pageHtml = "";
+    let pageTitle = "";
     try {
       pageTitle = await page.title();
       pageHtml = await page.content();
     } catch (err) {
-      request.log.error({ err }, 'failed to read live page content');
+      request.log.error({ err }, "failed to read live page content");
     }
     if (!pageHtml) {
-      return reply.status(400).send({ message: 'No page content captured. Load the page before Analyze.' });
+      return reply.status(400).send({
+        message: "No page content captured. Load the page before Analyze.",
+      });
     }
 
     const analysis = await analyzeJobFromHtml(pageHtml, pageTitle);
 
-    session.status = 'ANALYZED';
+    session.status = "ANALYZED";
     session.jobContext = {
-      title: analysis.title || 'Job',
-      company: 'N/A',
-      summary: 'Analysis from job description',
-      job_description_text: analysis.jobText ?? '',
+      title: analysis.title || "Job",
+      company: "N/A",
+      summary: "Analysis from job description",
+      job_description_text: analysis.jobText ?? "",
     };
 
     if (!useAi) {
@@ -1697,14 +2439,14 @@ async function bootstrap() {
       events.push({
         id: randomUUID(),
         sessionId: id,
-        eventType: 'ANALYZE_DONE',
+        eventType: "ANALYZE_DONE",
         payload: {
           recommendedLabel: analysis.recommendedLabel,
         },
         createdAt: new Date().toISOString(),
       });
       return {
-        mode: 'tech',
+        mode: "tech",
         recommendedLabel: analysis.recommendedLabel,
         ranked: topTech.map((t, idx) => ({
           id: t.id ?? t.label ?? `tech-${idx}`,
@@ -1717,13 +2459,18 @@ async function bootstrap() {
       };
     }
 
-    const jdText = String((session.jobContext as any)?.job_description_text ?? '');
-    const topResumes = jdText ? await getTopMatchedResumesFromSession(session, jdText, request.log) : [];
-    session.recommendedResumeId = topResumes[0]?.id ?? analysis.recommendedResumeId;
+    const jdText = String(
+      (session.jobContext as any)?.job_description_text ?? ""
+    );
+    const topResumes = jdText
+      ? await getTopMatchedResumesFromSession(session, jdText, request.log)
+      : [];
+    session.recommendedResumeId =
+      topResumes[0]?.id ?? analysis.recommendedResumeId;
     events.push({
       id: randomUUID(),
       sessionId: id,
-      eventType: 'ANALYZE_DONE',
+      eventType: "ANALYZE_DONE",
       payload: {
         recommendedLabel: topResumes[0]?.title ?? analysis.recommendedLabel,
         recommendedResumeId: topResumes[0]?.id ?? analysis.recommendedResumeId,
@@ -1731,19 +2478,27 @@ async function bootstrap() {
       createdAt: new Date().toISOString(),
     });
     return {
-      mode: 'resume',
+      mode: "resume",
       recommendedResumeId: topResumes[0]?.id ?? analysis.recommendedResumeId,
       recommendedLabel: topResumes[0]?.title ?? analysis.recommendedLabel,
-      ranked: topResumes.map((r, idx) => ({ id: r.id, label: r.title, rank: idx + 1, score: r.score })),
+      ranked: topResumes.map((r, idx) => ({
+        id: r.id,
+        label: r.title,
+        rank: idx + 1,
+        score: r.score,
+      })),
       scores: {},
       jobContext: session.jobContext,
     };
   });
 
   // Prompt-pack endpoints (HF-backed)
-  app.post('/llm/resume-parse', async (request, reply) => {
+  app.post("/llm/resume-parse", async (request, reply) => {
     const { resumeText, resumeId, filename, baseProfile } = request.body as any;
-    if (!resumeText || !resumeId) return reply.status(400).send({ message: 'resumeText and resumeId are required' });
+    if (!resumeText || !resumeId)
+      return reply
+        .status(400)
+        .send({ message: "resumeText and resumeId are required" });
     const prompt = promptBuilders.buildResumeParsePrompt({
       resumeId,
       filename,
@@ -1751,27 +2506,33 @@ async function bootstrap() {
       baseProfile,
     });
     const parsed = await callPromptPack(prompt);
-    if (!parsed) return reply.status(502).send({ message: 'LLM parse failed' });
+    if (!parsed) return reply.status(502).send({ message: "LLM parse failed" });
     return parsed;
   });
 
-  app.post('/llm/job-analyze', async (request, reply) => {
+  app.post("/llm/job-analyze", async (request, reply) => {
     const { job, baseProfile, prefs } = request.body as any;
-    if (!job?.job_description_text) return reply.status(400).send({ message: 'job_description_text required' });
+    if (!job?.job_description_text)
+      return reply
+        .status(400)
+        .send({ message: "job_description_text required" });
     const prompt = promptBuilders.buildJobAnalyzePrompt({
       job,
       baseProfile,
       prefs,
     });
     const parsed = await callPromptPack(prompt);
-    if (!parsed) return reply.status(502).send({ message: 'LLM analyze failed' });
+    if (!parsed)
+      return reply.status(502).send({ message: "LLM analyze failed" });
     return parsed;
   });
 
-  app.post('/llm/rank-resumes', async (request, reply) => {
+  app.post("/llm/rank-resumes", async (request, reply) => {
     const { job, resumes, baseProfile, prefs } = request.body as any;
     if (!job?.job_description_text || !Array.isArray(resumes)) {
-      return reply.status(400).send({ message: 'job_description_text and resumes[] required' });
+      return reply
+        .status(400)
+        .send({ message: "job_description_text and resumes[] required" });
     }
     const prompt = promptBuilders.buildRankResumesPrompt({
       job,
@@ -1780,13 +2541,21 @@ async function bootstrap() {
       prefs,
     });
     const parsed = await callPromptPack(prompt);
-    if (!parsed) return reply.status(502).send({ message: 'LLM rank failed' });
+    if (!parsed) return reply.status(502).send({ message: "LLM rank failed" });
     return parsed;
   });
 
-  app.post('/llm/autofill-plan', async (request, reply) => {
-    const { pageFields, baseProfile, prefs, jobContext, selectedResume, pageContext } = request.body as any;
-    if (!Array.isArray(pageFields)) return reply.status(400).send({ message: 'pageFields[] required' });
+  app.post("/llm/autofill-plan", async (request, reply) => {
+    const {
+      pageFields,
+      baseProfile,
+      prefs,
+      jobContext,
+      selectedResume,
+      pageContext,
+    } = request.body as any;
+    if (!Array.isArray(pageFields))
+      return reply.status(400).send({ message: "pageFields[] required" });
     const prompt = promptBuilders.buildAutofillPlanPrompt({
       pageFields,
       baseProfile,
@@ -1796,25 +2565,37 @@ async function bootstrap() {
       pageContext,
     });
     const parsed = await callPromptPack(prompt);
-    if (!parsed) return reply.status(502).send({ message: 'LLM autofill failed' });
+    if (!parsed)
+      return reply.status(502).send({ message: "LLM autofill failed" });
     return parsed;
   });
 
-  app.get('/label-aliases', async (request, reply) => {
+  app.get("/label-aliases", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || actor.role !== 'ADMIN') {
-      return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+    if (!actor || actor.role !== "ADMIN") {
+      return reply
+        .status(403)
+        .send({ message: "Only admins can manage label aliases" });
     }
     const custom = await listLabelAliases();
     return { defaults: DEFAULT_LABEL_ALIASES, custom };
   });
 
-  app.post('/label-aliases', async (request, reply) => {
+  app.get("/application-phrases", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const custom = await listLabelAliases();
+    const phrases = buildApplicationSuccessPhrases(custom);
+    return { phrases };
+  });
+
+  app.post("/label-aliases", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || actor.role !== 'ADMIN') {
-      return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+    if (!actor || actor.role !== "ADMIN") {
+      return reply
+        .status(403)
+        .send({ message: "Only admins can manage label aliases" });
     }
     const schema = z.object({
       canonicalKey: z.string(),
@@ -1823,15 +2604,15 @@ async function bootstrap() {
     const body = schema.parse(request.body ?? {});
     const canonicalKey = body.canonicalKey.trim();
     if (!CANONICAL_LABEL_KEYS.has(canonicalKey)) {
-      return reply.status(400).send({ message: 'Unknown canonical key' });
+      return reply.status(400).send({ message: "Unknown canonical key" });
     }
     const normalizedAlias = normalizeLabelAlias(body.alias);
     if (!normalizedAlias) {
-      return reply.status(400).send({ message: 'Alias cannot be empty' });
+      return reply.status(400).send({ message: "Alias cannot be empty" });
     }
     const existing = await findLabelAliasByNormalized(normalizedAlias);
     if (existing) {
-      return reply.status(409).send({ message: 'Alias already exists' });
+      return reply.status(409).send({ message: "Alias already exists" });
     }
     const aliasRecord: LabelAlias = {
       id: randomUUID(),
@@ -1843,11 +2624,13 @@ async function bootstrap() {
     return aliasRecord;
   });
 
-  app.patch('/label-aliases/:id', async (request, reply) => {
+  app.patch("/label-aliases/:id", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || actor.role !== 'ADMIN') {
-      return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+    if (!actor || actor.role !== "ADMIN") {
+      return reply
+        .status(403)
+        .send({ message: "Only admins can manage label aliases" });
     }
     const { id } = request.params as { id: string };
     const schema = z.object({
@@ -1856,20 +2639,21 @@ async function bootstrap() {
     });
     const body = schema.parse(request.body ?? {});
     const existing = await findLabelAliasById(id);
-    if (!existing) return reply.status(404).send({ message: 'Alias not found' });
+    if (!existing)
+      return reply.status(404).send({ message: "Alias not found" });
 
     const canonicalKey = body.canonicalKey?.trim() || existing.canonicalKey;
     if (!CANONICAL_LABEL_KEYS.has(canonicalKey)) {
-      return reply.status(400).send({ message: 'Unknown canonical key' });
+      return reply.status(400).send({ message: "Unknown canonical key" });
     }
     const aliasText = (body.alias ?? existing.alias).trim();
     const normalizedAlias = normalizeLabelAlias(aliasText);
     if (!normalizedAlias) {
-      return reply.status(400).send({ message: 'Alias cannot be empty' });
+      return reply.status(400).send({ message: "Alias cannot be empty" });
     }
     const conflict = await findLabelAliasByNormalized(normalizedAlias);
     if (conflict && conflict.id !== id) {
-      return reply.status(409).send({ message: 'Alias already exists' });
+      return reply.status(409).send({ message: "Alias already exists" });
     }
     const updated: LabelAlias = {
       ...existing,
@@ -1882,175 +2666,213 @@ async function bootstrap() {
     return updated;
   });
 
-  app.delete('/label-aliases/:id', async (request, reply) => {
+  app.delete("/label-aliases/:id", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || actor.role !== 'ADMIN') {
-      return reply.status(403).send({ message: 'Only admins can manage label aliases' });
+    if (!actor || actor.role !== "ADMIN") {
+      return reply
+        .status(403)
+        .send({ message: "Only admins can manage label aliases" });
     }
     const { id } = request.params as { id: string };
     const existing = await findLabelAliasById(id);
-    if (!existing) return reply.status(404).send({ message: 'Alias not found' });
+    if (!existing)
+      return reply.status(404).send({ message: "Alias not found" });
     await deleteLabelAlias(id);
-    return { status: 'deleted', id };
+    return { status: "deleted", id };
   });
 
-  app.post('/sessions/:id/autofill', async (request, reply) => {
+  app.post("/sessions/:id/autofill", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
-    const body = (request.body as { selectedResumeId?: string; pageFields?: any[]; useLlm?: boolean }) ?? {};
+    const body =
+      (request.body as {
+        selectedResumeId?: string;
+        pageFields?: any[];
+        useLlm?: boolean;
+      }) ?? {};
     const session = sessions.find((s) => s.id === id);
-    if (!session) return reply.status(404).send({ message: 'Session not found' });
+    if (!session)
+      return reply.status(404).send({ message: "Session not found" });
     const profile = await findProfileById(session.profileId);
-    if (!profile) return reply.status(404).send({ message: 'Profile not found' });
+    if (!profile)
+      return reply.status(404).send({ message: "Profile not found" });
     if (body.selectedResumeId) {
       session.selectedResumeId = body.selectedResumeId;
     }
 
-    const profileResumes = await listResumesByProfile(session.profileId);
-    const resumeId =
-      session.selectedResumeId ?? session.recommendedResumeId ?? body.selectedResumeId ?? profileResumes[0]?.id;
-    const resumeRecord = resumeId ? await findResumeById(resumeId) : undefined;
-    const hydratedResume = resumeRecord ? await hydrateResume(resumeRecord, profile.baseInfo) : undefined;
-
     const live = livePages.get(id);
     const page = live?.page;
-    let pageFields: any[] = [];
-    if (page) {
+    const hasClientFields = Array.isArray(body.pageFields);
+    let pageFields: any[] = hasClientFields ? body.pageFields ?? [] : [];
+    if (!hasClientFields && page) {
       try {
         pageFields = await collectPageFields(page);
       } catch (err) {
-        request.log.error({ err }, 'collectPageFields failed');
+        request.log.error({ err }, "collectPageFields failed");
       }
     }
 
-    const candidateFields: any[] =
-      Array.isArray(body.pageFields) && body.pageFields.length > 0
-        ? body.pageFields
-        : pageFields.length
-          ? pageFields
-          : DEFAULT_AUTOFILL_FIELDS;
+    const candidateFields: any[] = pageFields.length
+      ? pageFields
+      : DEFAULT_AUTOFILL_FIELDS;
 
-    const autofillValues = buildAutofillValueMap(profile.baseInfo ?? {}, session.jobContext ?? {}, hydratedResume?.parsedResume);
+    const autofillValues = buildAutofillValueMap(
+      profile.baseInfo ?? {},
+      session.jobContext ?? {}
+    );
     const aliasIndex = buildAliasIndex(await listLabelAliases());
     const useLlm = body.useLlm !== false;
 
-    let fillPlan: FillPlanResult = { filled: [], suggestions: [], blocked: [] };
+    let fillPlan: FillPlanResult = {
+      filled: [],
+      suggestions: [],
+      blocked: [],
+      actions: [],
+    };
     if (candidateFields.length > 0) {
       try {
-        fillPlan = await fillFieldsWithAliases(page, candidateFields, aliasIndex, autofillValues);
+        fillPlan = buildAliasFillPlan(
+          candidateFields,
+          aliasIndex,
+          autofillValues
+        );
       } catch (err) {
-        request.log.error({ err }, 'label-db autofill failed');
-        fillPlan = { filled: [], suggestions: [], blocked: [] };
+        request.log.error({ err }, "label-db autofill failed");
+        fillPlan = { filled: [], suggestions: [], blocked: [], actions: [] };
       }
     }
 
     try {
-      if (useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && hydratedResume?.resumeText && candidateFields.length > 0) {
+      if (
+        useLlm &&
+        (!fillPlan.filled || fillPlan.filled.length === 0) &&
+        candidateFields.length > 0
+      ) {
         const prompt = promptBuilders.buildAutofillPlanPrompt({
           pageFields: candidateFields,
           baseProfile: profile.baseInfo ?? {},
           prefs: {},
           jobContext: session.jobContext ?? {},
-          selectedResume: {
-            resume_id: hydratedResume.id,
-            label: hydratedResume.label,
-            parsed_resume_json: hydratedResume.parsedResume ?? {},
-            resume_text: hydratedResume.resumeText,
-          },
           pageContext: { url: session.url },
         });
         const parsed = await callPromptPack(prompt);
         const llmPlan = parsed?.result?.fill_plan;
         if (Array.isArray(llmPlan)) {
-        const filteredPlan = llmPlan.filter((f: any) => !shouldSkipPlanField(f, aliasIndex));
-        const applied = page ? await applyFillPlan(page, filteredPlan) : { filled: [], blocked: [], suggestions: [] };
-        const filledFromPlan = filteredPlan
-          .filter((f: any) => (f.action === 'fill' || f.action === 'select') && f.value)
-          .map((f: any) => ({
-            field: f.field_id ?? f.selector ?? f.label ?? 'field',
-            value: typeof f.value === 'string' ? f.value : JSON.stringify(f.value ?? ''),
-            confidence: typeof f.confidence === 'number' ? f.confidence : undefined,
-          }));
+          const filteredPlan = llmPlan.filter(
+            (f: any) => !shouldSkipPlanField(f, aliasIndex)
+          );
+          const actions: FillPlanAction[] = filteredPlan
+            .map((f: any) => ({
+              field: String(f.field_id ?? f.selector ?? f.label ?? "field"),
+              field_id: typeof f.field_id === "string" ? f.field_id : undefined,
+              label: typeof f.label === "string" ? f.label : undefined,
+              selector: typeof f.selector === "string" ? f.selector : undefined,
+              action: (f.action as FillPlanAction["action"]) ?? "fill",
+              value:
+                typeof f.value === "string"
+                  ? f.value
+                  : JSON.stringify(f.value ?? ""),
+              confidence:
+                typeof f.confidence === "number" ? f.confidence : undefined,
+            }))
+            .filter((f) => f.action !== "skip");
+          const filledFromPlan = actions
+            .filter((f) =>
+              ["fill", "select", "check", "uncheck"].includes(f.action)
+            )
+            .map((f) => ({
+              field: f.field,
+              value: f.value ?? "",
+              confidence: f.confidence,
+            }));
           const suggestions =
-            (Array.isArray(parsed?.warnings) ? parsed?.warnings : []).map((w: any) => ({
-              field: 'note',
-              suggestion: String(w),
-            })) ?? [];
+            (Array.isArray(parsed?.warnings) ? parsed?.warnings : []).map(
+              (w: any) => ({
+                field: "note",
+                suggestion: String(w),
+              })
+            ) ?? [];
           const blocked = llmPlan
             .filter((f: any) => f.requires_user_review)
-            .map((f: any) => f.field_id ?? f.selector ?? 'field');
+            .map((f: any) => f.field_id ?? f.selector ?? "field");
           fillPlan = {
-            filled: [...filledFromPlan, ...(applied.filled ?? [])],
-            suggestions: [...suggestions, ...(applied.suggestions ?? [])],
-            blocked: [...blocked, ...(applied.blocked ?? [])],
+            filled: filledFromPlan,
+            suggestions,
+            blocked,
+            actions,
           };
-          if ((!fillPlan.filled || fillPlan.filled.length === 0) && page) {
-            const simple = await simplePageFill(page, profile.baseInfo, hydratedResume.parsedResume);
-            fillPlan = {
-              filled: [...(fillPlan.filled ?? []), ...(simple.filled ?? [])],
-              suggestions: [...(fillPlan.suggestions ?? []), ...(simple.suggestions ?? [])],
-              blocked: [...(fillPlan.blocked ?? []), ...(simple.blocked ?? [])],
-            };
-          }
         }
       }
     } catch (err) {
-      request.log.error({ err }, 'LLM autofill failed, using demo plan');
+      request.log.error({ err }, "LLM autofill failed, using demo plan");
     }
 
-    if (!useLlm && (!fillPlan.filled || fillPlan.filled.length === 0) && page && candidateFields.length > 0) {
-      try {
-        fillPlan = await simplePageFill(page, profile.baseInfo, hydratedResume?.parsedResume);
-      } catch (e) {
-        request.log.error({ err: e }, 'simplePageFill failed');
-      }
-    }
-
-    if (!fillPlan.filled?.length && !fillPlan.suggestions?.length && !fillPlan.blocked?.length) {
+    if (
+      !fillPlan.filled?.length &&
+      !fillPlan.suggestions?.length &&
+      !fillPlan.blocked?.length
+    ) {
       fillPlan = buildDemoFillPlan(profile.baseInfo);
     }
 
-    session.status = 'FILLED';
-    session.selectedResumeId = resumeId ?? session.selectedResumeId;
+    session.status = "FILLED";
     session.fillPlan = fillPlan;
     events.push({
       id: randomUUID(),
       sessionId: id,
-      eventType: 'AUTOFILL_DONE',
+      eventType: "AUTOFILL_DONE",
       payload: session.fillPlan,
       createdAt: new Date().toISOString(),
     });
     return { fillPlan: session.fillPlan, pageFields, candidateFields };
   });
 
-  app.post('/sessions/:id/mark-submitted', async (request, reply) => {
+  app.post("/sessions/:id/mark-submitted", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { id } = request.params as { id: string };
     const session = sessions.find((s) => s.id === id);
-    if (!session) return reply.status(404).send({ message: 'Session not found' });
-    session.status = 'SUBMITTED';
+    if (!session)
+      return reply.status(404).send({ message: "Session not found" });
+    session.status = "SUBMITTED";
     session.endedAt = new Date().toISOString();
+    try {
+      const record: ApplicationRecord = {
+        id: randomUUID(),
+        sessionId: id,
+        bidderUserId: session.bidderUserId,
+        profileId: session.profileId,
+        resumeId:
+          session.selectedResumeId ?? session.recommendedResumeId ?? null,
+        url: session.url ?? "",
+        domain: session.domain ?? tryExtractDomain(session.url ?? ""),
+        createdAt: new Date().toISOString(),
+      };
+      await insertApplication(record);
+    } catch (err) {
+      request.log.error({ err }, "failed to insert application record");
+    }
     await stopBrowserSession(id);
     events.push({
       id: randomUUID(),
       sessionId: id,
-      eventType: 'SUBMITTED',
+      eventType: "SUBMITTED",
       createdAt: new Date().toISOString(),
     });
     return { status: session.status };
   });
 
-  app.get('/sessions', async (request, reply) => {
+  app.get("/sessions", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
-    const bidderUserId = (request.query as { bidderUserId?: string }).bidderUserId;
+    const bidderUserId = (request.query as { bidderUserId?: string })
+      .bidderUserId;
     const filtered = bidderUserId
       ? sessions.filter((s) => s.bidderUserId === bidderUserId)
       : sessions;
     return filtered;
   });
 
-  app.get('/users', async (request, reply) => {
+  app.get("/users", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const { role } = request.query as { role?: string };
     const roleFilter = role ? role.toUpperCase() : null;
@@ -2070,35 +2892,45 @@ async function bootstrap() {
     return rows;
   });
 
-  app.patch('/users/:id/role', async (request, reply) => {
+  app.patch("/users/:id/role", async (request, reply) => {
     const actor = request.authUser;
-    if (!actor || actor.role !== 'ADMIN') {
-      return reply.status(403).send({ message: 'Only admins can update roles' });
+    if (!actor || actor.role !== "ADMIN") {
+      return reply
+        .status(403)
+        .send({ message: "Only admins can update roles" });
     }
     const { id } = request.params as { id: string };
-    const schema = z.object({ role: z.enum(['ADMIN', 'MANAGER', 'BIDDER', 'OBSERVER']) });
+    const schema = z.object({
+      role: z.enum(["ADMIN", "MANAGER", "BIDDER", "OBSERVER"]),
+    });
     const body = schema.parse(request.body);
-    await pool.query('UPDATE users SET role = $1 WHERE id = $2', [body.role, id]);
+    await pool.query("UPDATE users SET role = $1 WHERE id = $2", [
+      body.role,
+      id,
+    ]);
     const updated = await findUserById(id);
     return updated;
   });
 
-  app.get('/metrics/my', async (request, reply) => {
+  app.get("/metrics/my", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
-    const bidderUserId = (request.query as { bidderUserId?: string }).bidderUserId;
+    const bidderUserId = (request.query as { bidderUserId?: string })
+      .bidderUserId;
     const userSessions = bidderUserId
       ? sessions.filter((s) => s.bidderUserId === bidderUserId)
       : sessions;
     const tried = userSessions.length;
-    const submitted = userSessions.filter((s) => s.status === 'SUBMITTED').length;
+    const submitted = userSessions.filter(
+      (s) => s.status === "SUBMITTED"
+    ).length;
     const percentage = tried === 0 ? 0 : Math.round((submitted / tried) * 100);
     const now = new Date();
     const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
     const monthlyApplied = userSessions.filter(
       (s) =>
-        s.status === 'SUBMITTED' &&
+        s.status === "SUBMITTED" &&
         s.startedAt &&
-        new Date(s.startedAt).getTime() >= monthStart.getTime(),
+        new Date(s.startedAt).getTime() >= monthStart.getTime()
     ).length;
     return {
       tried,
@@ -2109,10 +2941,10 @@ async function bootstrap() {
     };
   });
 
-  app.get('/settings/llm', async () => llmSettings[0]);
-  app.post('/settings/llm', async (request) => {
+  app.get("/settings/llm", async () => llmSettings[0]);
+  app.post("/settings/llm", async (request) => {
     const schema = z.object({
-      provider: z.enum(['OPENAI', 'HUGGINGFACE']),
+      provider: z.enum(["OPENAI", "HUGGINGFACE"]),
       chatModel: z.string(),
       embedModel: z.string(),
       encryptedApiKey: z.string(),
@@ -2127,21 +2959,318 @@ async function bootstrap() {
     return llmSettings[0];
   });
 
-  app.get('/manager/bidders/summary', async (request, reply) => {
+  app.get("/manager/bidders/summary", async (request, reply) => {
     if (forbidObserver(reply, request.authUser)) return;
     const actor = request.authUser;
-    if (!actor || (actor.role !== 'MANAGER' && actor.role !== 'ADMIN')) {
-      return reply.status(403).send({ message: 'Only managers or admins can view bidders' });
+    if (!actor || (actor.role !== "MANAGER" && actor.role !== "ADMIN")) {
+      return reply
+        .status(403)
+        .send({ message: "Only managers or admins can view bidders" });
     }
     const rows = await listBidderSummaries();
     return rows;
+  });
+
+  app.get("/manager/applications", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor || (actor.role !== "MANAGER" && actor.role !== "ADMIN")) {
+      return reply
+        .status(403)
+        .send({ message: "Only managers or admins can view applications" });
+    }
+    const rows = await listApplications();
+    return rows;
+  });
+
+  // Community: Edit message
+  app.patch("/community/messages/:messageId", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const { messageId } = request.params as { messageId: string };
+    const schema = z.object({ body: z.string() });
+    const body = schema.parse(request.body);
+    const text = body.body.trim();
+    if (!text)
+      return reply.status(400).send({ message: "Message body required" });
+    const message = await getMessageById(messageId);
+    if (!message)
+      return reply.status(404).send({ message: "Message not found" });
+    if (message.senderId !== actor.id) {
+      return reply.status(403).send({ message: "Can only edit own messages" });
+    }
+    if (message.isDeleted) {
+      return reply.status(400).send({ message: "Cannot edit deleted message" });
+    }
+    const updated = await editMessage(messageId, text);
+    return updated;
+  });
+
+  // Community: Delete message
+  app.delete("/community/messages/:messageId", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const { messageId } = request.params as { messageId: string };
+    const message = await getMessageById(messageId);
+    if (!message)
+      return reply.status(404).send({ message: "Message not found" });
+    const canDelete = message.senderId === actor.id || actor.role === "ADMIN";
+    if (!canDelete) {
+      return reply.status(403).send({ message: "Permission denied" });
+    }
+    const deleted = await deleteMessage(messageId);
+    return { success: deleted };
+  });
+
+  // Community: Add reaction
+  app.post(
+    "/community/messages/:messageId/reactions",
+    async (request, reply) => {
+      if (forbidObserver(reply, request.authUser)) return;
+      const actor = request.authUser;
+      if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+      const { messageId } = request.params as { messageId: string };
+      const schema = z.object({ emoji: z.string() });
+      const body = schema.parse(request.body);
+      const message = await getMessageById(messageId);
+      if (!message)
+        return reply.status(404).send({ message: "Message not found" });
+      const reaction = await addMessageReaction({
+        id: randomUUID(),
+        messageId,
+        userId: actor.id,
+        emoji: body.emoji,
+        createdAt: new Date().toISOString(),
+      });
+      return reaction;
+    }
+  );
+
+  // Community: Remove reaction
+  app.delete(
+    "/community/messages/:messageId/reactions/:emoji",
+    async (request, reply) => {
+      if (forbidObserver(reply, request.authUser)) return;
+      const actor = request.authUser;
+      if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+      const { messageId, emoji } = request.params as {
+        messageId: string;
+        emoji: string;
+      };
+      const removed = await removeMessageReaction(messageId, actor.id, emoji);
+      return { success: removed };
+    }
+  );
+
+  // Community: Pin message
+  app.post("/community/messages/:messageId/pin", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const { messageId } = request.params as { messageId: string };
+    const message = await getMessageById(messageId);
+    if (!message)
+      return reply.status(404).send({ message: "Message not found" });
+    
+    const thread = await findCommunityThreadById(message.threadId);
+    if (!thread) return reply.status(404).send({ message: "Thread not found" });
+    
+    const isMember = await isCommunityThreadMember(message.threadId, actor.id);
+    if (!isMember && thread.threadType === "DM") {
+      return reply.status(403).send({ message: "Not a member of this thread" });
+    }
+    
+    const pinned = await pinMessage(message.threadId, messageId, actor.id);
+    if (!pinned) {
+      return reply.status(409).send({ message: "Message already pinned" });
+    }
+    
+    // Broadcast pin event
+    const memberIds = await listCommunityThreadMemberIds(message.threadId);
+    const allowed = new Set(memberIds);
+    communityClients.forEach((c) => {
+      if (allowed.has(c.user.id)) {
+        sendCommunityPayload(c, {
+          type: "message_pinned",
+          pinned: {
+            threadId: message.threadId,
+            message: pinned.message
+          }
+        });
+      }
+    });
+    
+    return pinned;
+  });
+
+  // Community: Unpin message
+  app.delete("/community/messages/:messageId/pin", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const { messageId } = request.params as { messageId: string };
+    const message = await getMessageById(messageId);
+    if (!message)
+      return reply.status(404).send({ message: "Message not found" });
+    const unpinned = await unpinMessage(message.threadId, messageId);
+    
+    // Broadcast unpin event
+    if (unpinned) {
+      const memberIds = await listCommunityThreadMemberIds(message.threadId);
+      const allowed = new Set(memberIds);
+      communityClients.forEach((c) => {
+        if (allowed.has(c.user.id)) {
+          sendCommunityPayload(c, {
+            type: "message_unpinned",
+            unpinned: {
+              threadId: message.threadId,
+              messageId
+            }
+          });
+        }
+      });
+    }
+    
+    return { success: unpinned };
+  });
+
+  // Community: List pinned messages
+  app.get("/community/threads/:id/pins", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const { id } = request.params as { id: string };
+    const thread = await ensureCommunityThreadAccess(id, actor, reply);
+    if (!thread) return;
+    return listPinnedMessages(id);
+  });
+
+  // Community: Mark thread as read
+  app.post("/community/threads/:id/mark-read", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+    const { id } = request.params as { id: string };
+    const thread = await ensureCommunityThreadAccess(id, actor, reply);
+    if (!thread) return;
+    await markThreadAsRead(id, actor.id);
+    return { success: true };
+  });
+
+  // Community: File upload
+  app.post("/community/upload", async (request:any, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+
+    const data = await request.file();
+    if (!data) return reply.status(400).send({ message: "No file provided" });
+
+    const buffer = await data.toBuffer();
+    const fileName = data.filename;
+    const mimeType = data.mimetype;
+
+    if (buffer.length > 10 * 1024 * 1024) {
+      return reply.status(400).send({ message: "File too large. Max 10MB." });
+    }
+
+    const allowedTypes = [
+      "image/jpeg",
+      "image/png",
+      "image/gif",
+      "image/webp",
+      "application/pdf",
+      "application/zip",
+      "text/plain",
+      "text/csv",
+    ];
+    if (!allowedTypes.includes(mimeType)) {
+      return reply.status(400).send({ message: "File type not supported" });
+    }
+
+    try {
+      const { url } = await uploadToSupabase(buffer, fileName, mimeType);
+      return {
+        fileUrl: url,
+        fileName,
+        fileSize: buffer.length,
+        mimeType,
+      };
+    } catch (err) {
+      request.log.error({ err }, "File upload failed");
+      console.log(err)
+      return reply.status(500).send({ message: "Upload failed" });
+    }
+  });
+
+  // Community: Get unread summary
+  app.get("/community/unread-summary", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+
+    const { rows } = await pool.query<{
+      threadId: string;
+      threadType: string;
+      threadName: string | null;
+      unreadCount: number;
+      lastReadAt: string;
+    }>(
+      `
+        SELECT 
+          u.thread_id AS "threadId",
+          t.thread_type AS "threadType",
+          t.name AS "threadName",
+          u.unread_count AS "unreadCount",
+          u.last_read_at AS "lastReadAt"
+        FROM community_unread_messages u
+        JOIN community_threads t ON t.id = u.thread_id
+        WHERE u.user_id = $1 AND u.unread_count > 0
+        ORDER BY u.updated_at DESC
+      `,
+      [actor.id]
+    );
+
+    return { unreads: rows };
+  });
+
+  // Community: Update user presence
+  app.post("/community/presence", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+
+    const schema = z.object({
+      status: z.enum(["online", "away", "busy", "offline"]),
+    });
+    const body = schema.parse(request.body);
+
+    await updateUserPresence(actor.id, body.status);
+    return { success: true };
+  });
+
+  // Community: Get presence for users
+  app.get("/community/presence", async (request, reply) => {
+    if (forbidObserver(reply, request.authUser)) return;
+    const actor = request.authUser;
+    if (!actor) return reply.status(401).send({ message: "Unauthorized" });
+
+    const query = request.query as { userIds?: string };
+    const userIds = query.userIds ? query.userIds.split(",") : [];
+
+    if (userIds.length === 0) return { presences: [] };
+
+    const presences = await listUserPresences(userIds);
+    return { presences };
   });
 
   app.ready((err) => {
     if (err) app.log.error(err);
   });
 
-  app.listen({ port: PORT, host: '0.0.0.0' }, (err) => {
+  app.listen({ port: PORT, host: "0.0.0.0" }, (err) => {
     if (err) {
       app.log.error(err);
       process.exit(1);
@@ -2149,41 +3278,146 @@ async function bootstrap() {
     app.log.info(`API running on http://localhost:${PORT}`);
   });
 
-  app.get('/ws/browser/:sessionId', { websocket: true }, async (connection, req) => {
-    // Allow ws without auth for now to keep demo functional
-    if (!connection || !connection.socket) {
+  app.get("/ws/community", { websocket: true }, async (socket, req) => {
+    const token = readWsToken(req);
+    if (!token) {
+      socket.close();
       return;
     }
-    const { sessionId } = req.params as { sessionId: string };
-    const live = livePages.get(sessionId);
-    if (!live) {
-      connection.socket?.send(JSON.stringify({ type: 'error', message: 'No live browser' }));
-      connection.socket?.close();
+    let user: User | undefined;
+    try {
+      const decoded = verifyToken(token);
+      user = await findUserById(decoded.sub);
+    } catch {
+      socket.close();
       return;
     }
+    if (!user || user.isActive === false || user.role === "OBSERVER") {
+      socket.close();
+      return;
+    }
+    const client: CommunityWsClient = { socket, user };
+    communityClients.add(client);
+    app.log.info({ userId: user.id }, "community ws connected");
+    sendCommunityPayload(client, { type: "community_ready" });
 
-    const { page } = live;
-    const sendFrame = async () => {
+    // Handle incoming messages (typing indicators, etc.)
+    socket.on("message", async (data: Buffer) => {
       try {
-        const buf = await page.screenshot({ fullPage: true });
-        connection.socket?.send(JSON.stringify({ type: 'frame', data: buf.toString('base64') }));
+        const payload = JSON.parse(data.toString()) as {
+          type?: string;
+          threadId?: string;
+          [key: string]: any;
+        };
+
+        if (payload.type === "typing:start" && payload.threadId) {
+          const thread = await findCommunityThreadById(payload.threadId);
+          if (!thread) return;
+
+          const memberIds = await listCommunityThreadMemberIds(
+            payload.threadId
+          );
+          const allowed = new Set(memberIds);
+
+          communityClients.forEach((c) => {
+            if (c.user.id !== user!.id && allowed.has(c.user.id)) {
+              sendCommunityPayload(c, {
+                type: "typing",
+                typing: {
+                  threadId: payload.threadId,
+                  userId: user!.id,
+                  userName: user!.name,
+                  action: "start"
+                }
+              });
+            }
+          });
+        } else if (payload.type === "typing:stop" && payload.threadId) {
+          const thread = await findCommunityThreadById(payload.threadId);
+          if (!thread) return;
+
+          const memberIds = await listCommunityThreadMemberIds(
+            payload.threadId
+          );
+          const allowed = new Set(memberIds);
+
+          communityClients.forEach((c) => {
+            if (c.user.id !== user!.id && allowed.has(c.user.id)) {
+              sendCommunityPayload(c, {
+                type: "typing",
+                typing: {
+                  threadId: payload.threadId,
+                  userId: user!.id,
+                  userName: user!.name,
+                  action: "stop"
+                }
+              });
+            }
+          });
+        }
       } catch (err) {
-        connection.socket?.send(JSON.stringify({ type: 'error', message: 'Could not capture frame' }));
-      }
-    };
-
-    // Send frames every second
-    const interval = setInterval(sendFrame, 1000);
-    livePages.set(sessionId, { ...live, interval });
-
-    connection.socket.on('close', () => {
-      clearInterval(interval);
-      const current = livePages.get(sessionId);
-      if (current) {
-        livePages.set(sessionId, { browser: current.browser, page: current.page });
+        app.log.error({ err }, "websocket message parse error");
       }
     });
+
+    socket.on("close", async () => {
+      communityClients.delete(client);
+      await updateUserPresence(user!.id, "offline");
+      app.log.info({ userId: user.id }, "community ws disconnected");
+    });
+
+    // Set user online
+    await updateUserPresence(user.id, "online");
   });
+
+  app.get(
+    "/ws/browser/:sessionId",
+    { websocket: true },
+    async (socket, req) => {
+      // Allow ws without auth for now to keep demo functional
+      const { sessionId } = req.params as { sessionId: string };
+      const live = livePages.get(sessionId);
+      if (!live) {
+        socket.send(
+          JSON.stringify({ type: "error", message: "No live browser" })
+        );
+        socket.close();
+        return;
+      }
+
+      const { page } = live;
+      const sendFrame = async () => {
+        try {
+          const buf = await page.screenshot({ fullPage: true });
+          socket.send(
+            JSON.stringify({ type: "frame", data: buf.toString("base64") })
+          );
+        } catch (err) {
+          socket.send(
+            JSON.stringify({
+              type: "error",
+              message: "Could not capture frame",
+            })
+          );
+        }
+      };
+
+      // Send frames every second
+      const interval = setInterval(sendFrame, 1000);
+      livePages.set(sessionId, { ...live, interval });
+
+      socket.on("close", () => {
+        clearInterval(interval);
+        const current = livePages.get(sessionId);
+        if (current) {
+          livePages.set(sessionId, {
+            browser: current.browser,
+            page: current.page,
+          });
+        }
+      });
+    }
+  );
 }
 
 function tryExtractDomain(url: string) {
@@ -2198,54 +3432,87 @@ function tryExtractDomain(url: string) {
 function buildDemoFillPlan(baseInfo: BaseInfo): FillPlanResult {
   const phone = formatPhone(baseInfo?.contact);
   const safeFields = [
-    { field: 'first_name', value: baseInfo?.name?.first, confidence: 0.98 },
-    { field: 'last_name', value: baseInfo?.name?.last, confidence: 0.98 },
-    { field: 'email', value: baseInfo?.contact?.email, confidence: 0.97 },
-    { field: 'phone_code', value: baseInfo?.contact?.phoneCode, confidence: 0.75 },
-    { field: 'phone_number', value: baseInfo?.contact?.phoneNumber, confidence: 0.78 },
-    { field: 'phone', value: phone, confidence: 0.8 },
-    { field: 'address', value: baseInfo?.location?.address, confidence: 0.75 },
-    { field: 'city', value: baseInfo?.location?.city, confidence: 0.75 },
-    { field: 'state', value: baseInfo?.location?.state, confidence: 0.72 },
-    { field: 'country', value: baseInfo?.location?.country, confidence: 0.72 },
-    { field: 'postal_code', value: baseInfo?.location?.postalCode, confidence: 0.72 },
-    { field: 'linkedin', value: baseInfo?.links?.linkedin, confidence: 0.78 },
-    { field: 'job_title', value: baseInfo?.career?.jobTitle, confidence: 0.7 },
-    { field: 'current_company', value: baseInfo?.career?.currentCompany, confidence: 0.68 },
-    { field: 'years_exp', value: baseInfo?.career?.yearsExp, confidence: 0.6 },
-    { field: 'desired_salary', value: baseInfo?.career?.desiredSalary, confidence: 0.62 },
-    { field: 'school', value: baseInfo?.education?.school, confidence: 0.66 },
-    { field: 'degree', value: baseInfo?.education?.degree, confidence: 0.65 },
-    { field: 'major_field', value: baseInfo?.education?.majorField, confidence: 0.64 },
-    { field: 'graduation_at', value: baseInfo?.education?.graduationAt, confidence: 0.6 },
+    { field: "first_name", value: baseInfo?.name?.first, confidence: 0.98 },
+    { field: "last_name", value: baseInfo?.name?.last, confidence: 0.98 },
+    { field: "email", value: baseInfo?.contact?.email, confidence: 0.97 },
+    {
+      field: "phone_code",
+      value: baseInfo?.contact?.phoneCode,
+      confidence: 0.75,
+    },
+    {
+      field: "phone_number",
+      value: baseInfo?.contact?.phoneNumber,
+      confidence: 0.78,
+    },
+    { field: "phone", value: phone, confidence: 0.8 },
+    { field: "address", value: baseInfo?.location?.address, confidence: 0.75 },
+    { field: "city", value: baseInfo?.location?.city, confidence: 0.75 },
+    { field: "state", value: baseInfo?.location?.state, confidence: 0.72 },
+    { field: "country", value: baseInfo?.location?.country, confidence: 0.72 },
+    {
+      field: "postal_code",
+      value: baseInfo?.location?.postalCode,
+      confidence: 0.72,
+    },
+    { field: "linkedin", value: baseInfo?.links?.linkedin, confidence: 0.78 },
+    { field: "job_title", value: baseInfo?.career?.jobTitle, confidence: 0.7 },
+    {
+      field: "current_company",
+      value: baseInfo?.career?.currentCompany,
+      confidence: 0.68,
+    },
+    { field: "years_exp", value: baseInfo?.career?.yearsExp, confidence: 0.6 },
+    {
+      field: "desired_salary",
+      value: baseInfo?.career?.desiredSalary,
+      confidence: 0.62,
+    },
+    { field: "school", value: baseInfo?.education?.school, confidence: 0.66 },
+    { field: "degree", value: baseInfo?.education?.degree, confidence: 0.65 },
+    {
+      field: "major_field",
+      value: baseInfo?.education?.majorField,
+      confidence: 0.64,
+    },
+    {
+      field: "graduation_at",
+      value: baseInfo?.education?.graduationAt,
+      confidence: 0.6,
+    },
   ];
   const filled = safeFields
     .filter((f) => Boolean(f.value))
-    .map((f) => ({ field: f.field, value: String(f.value ?? ''), confidence: f.confidence }));
+    .map((f) => ({
+      field: f.field,
+      value: String(f.value ?? ""),
+      confidence: f.confidence,
+    }));
   return {
     filled,
     suggestions: [],
-    blocked: ['EEO', 'veteran_status', 'disability'],
+    blocked: ["EEO", "veteran_status", "disability"],
+    actions: [],
   };
 }
 
 function resolveResumePath(p: string) {
-  if (!p) return '';
+  if (!p) return "";
   if (path.isAbsolute(p)) {
     // If an absolute path was previously stored, fall back to the shared resumes directory using the filename.
     const fileName = path.basename(p);
     return path.join(RESUME_DIR, fileName);
   }
-  const normalized = p.replace(/\\/g, '/');
-  if (normalized.startsWith('/data/resumes/')) {
-    const fileName = normalized.split('/').pop() ?? '';
+  const normalized = p.replace(/\\/g, "/");
+  if (normalized.startsWith("/data/resumes/")) {
+    const fileName = normalized.split("/").pop() ?? "";
     return path.join(RESUME_DIR, fileName);
   }
-  if (normalized.startsWith('/resumes/')) {
-    const fileName = normalized.split('/').pop() ?? '';
+  if (normalized.startsWith("/resumes/")) {
+    const fileName = normalized.split("/").pop() ?? "";
     return path.join(RESUME_DIR, fileName);
   }
-  const trimmed = normalized.replace(/^\.?\\?\//, '');
+  const trimmed = normalized.replace(/^\.?\\?\//, "");
   return path.join(PROJECT_ROOT, trimmed);
 }
 
@@ -2253,60 +3520,60 @@ bootstrap();
 
 function normalizeScore(parsed: any): number | undefined {
   const val =
-    typeof parsed === 'number'
+    typeof parsed === "number"
       ? parsed
-      : typeof parsed === 'string'
-        ? Number(parsed)
-        : typeof parsed?.score === 'number'
-          ? parsed.score
-          : typeof parsed?.result?.score === 'number'
-            ? parsed.result.score
-            : undefined;
-  if (typeof val === 'number' && !Number.isNaN(val) && val >= 0 && val <= 100) {
+      : typeof parsed === "string"
+      ? Number(parsed)
+      : typeof parsed?.score === "number"
+      ? parsed.score
+      : typeof parsed?.result?.score === "number"
+      ? parsed.result.score
+      : undefined;
+  if (typeof val === "number" && !Number.isNaN(val) && val >= 0 && val <= 100) {
     return val;
   }
   return undefined;
 }
 
 const STOP_WORDS = new Set([
-  'the',
-  'and',
-  'for',
-  'with',
-  'from',
-  'this',
-  'that',
-  'you',
-  'your',
-  'are',
-  'will',
-  'have',
-  'our',
-  'we',
-  'they',
-  'their',
-  'about',
-  'into',
-  'what',
-  'when',
-  'where',
-  'which',
-  'while',
-  'without',
-  'within',
-  'such',
-  'using',
-  'used',
-  'use',
-  'role',
-  'team',
-  'work',
-  'experience',
-  'skills',
-  'ability',
-  'strong',
-  'including',
-  'include',
+  "the",
+  "and",
+  "for",
+  "with",
+  "from",
+  "this",
+  "that",
+  "you",
+  "your",
+  "are",
+  "will",
+  "have",
+  "our",
+  "we",
+  "they",
+  "their",
+  "about",
+  "into",
+  "what",
+  "when",
+  "where",
+  "which",
+  "while",
+  "without",
+  "within",
+  "such",
+  "using",
+  "used",
+  "use",
+  "role",
+  "team",
+  "work",
+  "experience",
+  "skills",
+  "ability",
+  "strong",
+  "including",
+  "include",
 ]);
 
 function tokenize(text: string): string[] {
@@ -2335,45 +3602,53 @@ function overlapCount(tokens: Set<string>, keywords: Set<string>): number {
   return count;
 }
 
-async function callHfScore(prompt: string, logger?: any, resumeId?: string): Promise<any | undefined> {
+async function callHfScore(
+  prompt: string,
+  logger?: any,
+  resumeId?: string
+): Promise<any | undefined> {
   if (!HF_TOKEN) {
-    logger?.warn({ resumeId }, 'hf-score-skip-no-token');
+    logger?.warn({ resumeId }, "hf-score-skip-no-token");
     return undefined;
   }
   try {
-    const res = await fetch('https://router.huggingface.co/v1/chat/completions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${HF_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        model: HF_MODEL,
-        messages: [{ role: 'user', content: prompt }],
-        max_tokens: 128,
-        temperature: 0.1,
-        top_p: 0.9,
-        n: 1,
-      }),
-    });
+    const res = await fetch(
+      "https://router.huggingface.co/v1/chat/completions",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${HF_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          model: HF_MODEL,
+          messages: [{ role: "user", content: prompt }],
+          max_tokens: 128,
+          temperature: 0.1,
+          top_p: 0.9,
+          n: 1,
+        }),
+      }
+    );
     const data = (await res.json()) as any;
     const choiceContent =
       data?.choices?.[0]?.message?.content ||
       (Array.isArray(data) && data[0]?.generated_text) ||
       data?.generated_text ||
       data?.text;
-    const text = typeof choiceContent === 'string' ? choiceContent.trim() : undefined;
+    const text =
+      typeof choiceContent === "string" ? choiceContent.trim() : undefined;
     if (text) {
       try {
         return JSON.parse(text);
       } catch {
-        logger?.warn({ resumeId }, 'hf-score-parse-text-failed');
+        logger?.warn({ resumeId }, "hf-score-parse-text-failed");
       }
     }
-    if (data && typeof data === 'object' && !data.error) return data;
-    logger?.warn({ resumeId, data }, 'hf-score-unexpected-response');
+    if (data && typeof data === "object" && !data.error) return data;
+    logger?.warn({ resumeId, data }, "hf-score-unexpected-response");
   } catch (err) {
-    logger?.error({ resumeId }, 'hf-score-call-failed');
+    logger?.error({ resumeId }, "hf-score-call-failed");
   }
   return undefined;
 }
@@ -2383,10 +3658,10 @@ async function scoreResumeWithHf(
   resumeText: string,
   logger?: any,
   resumeId?: string,
-  opts?: { title?: string; keywords?: string[] },
+  opts?: { title?: string; keywords?: string[] }
 ): Promise<number | undefined> {
   if (!jdText.trim() || !resumeText.trim()) {
-    logger?.warn({ resumeId }, 'hf-score-skip-empty');
+    logger?.warn({ resumeId }, "hf-score-skip-empty");
     return undefined;
   }
   const prompt = `You are a resume matcher. Score how well the resume fits the job.
@@ -2394,8 +3669,8 @@ Return ONLY valid JSON: {"score": number_between_0_and_100}
 - 100 = perfect fit, 0 = not a fit.
 - Emphasize required skills, title fit, and domain.
 - Ignore formatting; be concise.
-Job Title: ${opts?.title ?? 'Unknown'}
-Key skills to emphasize: ${opts?.keywords?.join(', ') || 'n/a'}
+Job Title: ${opts?.title ?? "Unknown"}
+Key skills to emphasize: ${opts?.keywords?.join(", ") || "n/a"}
 Job Description (truncated):
 ${jdText.slice(0, 3000)}
 
@@ -2403,16 +3678,22 @@ Resume (truncated):
 ${resumeText.slice(0, 6000)}
 `;
   try {
-    const parsed = (await callHfScore(prompt, logger, resumeId)) ?? (await callPromptPack(prompt));
+    const parsed =
+      (await callHfScore(prompt, logger, resumeId)) ??
+      (await callPromptPack(prompt));
     const scoreVal = normalizeScore(parsed);
-    if (typeof scoreVal === 'number') return Math.round(scoreVal);
-    logger?.warn({ resumeId, parsed }, 'hf-score-parse-failed');
+    if (typeof scoreVal === "number") return Math.round(scoreVal);
+    logger?.warn({ resumeId, parsed }, "hf-score-parse-failed");
   } catch {
-    logger?.error({ resumeId }, 'hf-score-exception');
+    logger?.error({ resumeId }, "hf-score-exception");
   }
 }
 
-async function getTopMatchedResumesFromSession(session: ApplicationSession, jdText: string, logger: any) {
+async function getTopMatchedResumesFromSession(
+  session: ApplicationSession,
+  jdText: string,
+  logger: any
+) {
   const profile = await findProfileById(session.profileId);
   const resumesForProfile = await listResumesByProfile(session.profileId);
   const limited = resumesForProfile.slice(0, 200);
@@ -2420,7 +3701,8 @@ async function getTopMatchedResumesFromSession(session: ApplicationSession, jdTe
   const keywordSet = new Set(keywords);
   const title = (session.jobContext as any)?.title as string | undefined;
 
-  const scored: { id: string; title: string; score: number; tie: number }[] = [];
+  const scored: { id: string; title: string; score: number; tie: number }[] =
+    [];
   for (const r of limited) {
     let hydrated = r;
     try {
@@ -2428,30 +3710,38 @@ async function getTopMatchedResumesFromSession(session: ApplicationSession, jdTe
     } catch {
       // ignore hydrate errors, fall back to DB text
     }
-    const resumeText = hydrated.resumeText ?? '';
-    const hfScore = await scoreResumeWithHf(jdText, resumeText, logger, r.id, { title, keywords });
-    const finalScore = typeof hfScore === 'number' ? hfScore : 0;
+    const resumeText = hydrated.resumeText ?? "";
+    const hfScore = await scoreResumeWithHf(jdText, resumeText, logger, r.id, {
+      title,
+      keywords,
+    });
+    const finalScore = typeof hfScore === "number" ? hfScore : 0;
     const resumeTokens = new Set(tokenize(resumeText));
     const tie = overlapCount(resumeTokens, keywordSet);
-    logger.info({ resumeId: r.id, score: finalScore, tie }, 'resume-scored');
+    logger.info({ resumeId: r.id, score: finalScore, tie }, "resume-scored");
     scored.push({ id: r.id, title: r.label, score: finalScore, tie });
   }
   return scored
-    .sort((a, b) => b.score - a.score || b.tie - a.tie || a.title.localeCompare(b.title))
+    .sort(
+      (a, b) =>
+        b.score - a.score || b.tie - a.tie || a.title.localeCompare(b.title)
+    )
     .slice(0, 4);
 }
 
 async function startBrowserSession(session: ApplicationSession) {
   const existing = livePages.get(session.id);
   if (existing) {
-    await existing.page.goto(session.url, { waitUntil: 'domcontentloaded' });
+    await existing.page.goto(session.url, { waitUntil: "domcontentloaded" });
     await focusFirstField(existing.page);
     return;
   }
 
   const browser = await chromium.launch({ headless: true });
-  const page = await browser.newPage({ viewport: { width: 1400, height: 1400 } });
-  await page.goto(session.url, { waitUntil: 'domcontentloaded' });
+  const page = await browser.newPage({
+    viewport: { width: 1400, height: 1400 },
+  });
+  await page.goto(session.url, { waitUntil: "domcontentloaded" });
   await focusFirstField(page);
   livePages.set(session.id, { browser, page });
 }
@@ -2467,9 +3757,80 @@ async function stopBrowserSession(sessionId: string) {
 
 async function focusFirstField(page: Page) {
   try {
-    const locator = page.locator('input, textarea, select').first();
+    const locator = page.locator("input, textarea, select").first();
     await locator.scrollIntoViewIfNeeded({ timeout: 4000 });
   } catch {
     // ignore
   }
+}
+
+async function broadcastReactionEvent(
+  threadId: string,
+  messageId: string,
+  event: "add" | "remove",
+  userId: string,
+  emoji: string
+) {
+  const thread = await findCommunityThreadById(threadId);
+  if (!thread) return;
+
+  const payload = {
+    type: event === "add" ? "reaction:add" : "reaction:remove",
+    threadId,
+    messageId,
+    userId,
+    emoji,
+  };
+
+  const memberIds = await listCommunityThreadMemberIds(threadId);
+  const allowed = new Set(memberIds);
+
+  communityClients.forEach((client) => {
+    if (allowed.has(client.user.id)) {
+      sendCommunityPayload(client, payload);
+    }
+  });
+}
+
+async function broadcastMessageEdit(
+  threadId: string,
+  message: CommunityMessage
+) {
+  const thread = await findCommunityThreadById(threadId);
+  if (!thread) return;
+
+  const payload = {
+    type: "message:edited",
+    threadId,
+    message,
+  };
+
+  const memberIds = await listCommunityThreadMemberIds(threadId);
+  const allowed = new Set(memberIds);
+
+  communityClients.forEach((client) => {
+    if (allowed.has(client.user.id)) {
+      sendCommunityPayload(client, payload);
+    }
+  });
+}
+
+async function broadcastMessageDelete(threadId: string, messageId: string) {
+  const thread = await findCommunityThreadById(threadId);
+  if (!thread) return;
+
+  const payload = {
+    type: "message:deleted",
+    threadId,
+    messageId,
+  };
+
+  const memberIds = await listCommunityThreadMemberIds(threadId);
+  const allowed = new Set(memberIds);
+
+  communityClients.forEach((client) => {
+    if (allowed.has(client.user.id)) {
+      sendCommunityPayload(client, payload);
+    }
+  });
 }

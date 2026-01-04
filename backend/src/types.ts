@@ -1,4 +1,4 @@
-export type UserRole = 'ADMIN' | 'MANAGER' | 'BIDDER' | 'OBSERVER';
+export type UserRole = "ADMIN" | "MANAGER" | "BIDDER" | "OBSERVER";
 
 export interface User {
   id: string;
@@ -9,7 +9,7 @@ export interface User {
   password?: string;
 }
 
-export type CalendarProvider = 'MICROSOFT' | 'GOOGLE';
+export type CalendarProvider = "MICROSOFT" | "GOOGLE";
 
 export interface ProfileAccount {
   id: string;
@@ -18,7 +18,7 @@ export interface ProfileAccount {
   email: string;
   displayName?: string | null;
   timezone?: string | null;
-  status?: 'ACTIVE' | 'INACTIVE';
+  status?: "ACTIVE" | "INACTIVE";
   lastSyncAt?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -145,15 +145,171 @@ export interface ApplicationEvent {
   createdAt: string;
 }
 
-export type LlmProvider = 'OPENAI' | 'HUGGINGFACE';
+export interface ApplicationRecord {
+  id: string;
+  sessionId: string;
+  bidderUserId: string;
+  profileId: string;
+  resumeId?: string | null;
+  url: string;
+  domain?: string | null;
+  createdAt: string;
+}
+
+export interface ApplicationSummary {
+  id: string;
+  sessionId: string;
+  bidderUserId?: string | null;
+  bidderName?: string | null;
+  bidderEmail?: string | null;
+  profileId?: string | null;
+  profileDisplayName?: string | null;
+  resumeId?: string | null;
+  resumeLabel?: string | null;
+  url?: string | null;
+  domain?: string | null;
+  createdAt: string;
+}
+
+export type LlmProvider = "OPENAI" | "HUGGINGFACE";
 
 export interface LlmSettings {
   id: string;
-  ownerType: 'ORG' | 'USER';
+  ownerType: "ORG" | "USER";
   ownerId: string;
   provider: LlmProvider;
   encryptedApiKey: string;
   chatModel: string;
   embedModel: string;
   updatedAt: string;
+}
+export type CommunityThreadType = "CHANNEL" | "DM";
+
+export interface CommunityThread {
+  id: string;
+  threadType: CommunityThreadType;
+  name?: string | null;
+  nameKey?: string | null;
+  description?: string | null;
+  createdBy?: string | null;
+  isPrivate: boolean;
+  createdAt: string;
+  lastMessageAt?: string | null;
+}
+
+
+export interface CommunityThreadParticipant {
+  id: string;
+  name: string;
+  email: string;
+}
+
+export interface CommunityThreadSummary {
+  id: string;
+  threadType: CommunityThreadType;
+  name?: string | null;
+  description?: string | null;
+  isPrivate: boolean;
+  createdAt: string;
+  lastMessageAt?: string | null;
+  participants?: CommunityThreadParticipant[];
+}
+
+export interface CommunityMessage {
+  id: string;
+  threadId: string;
+  senderId: string;
+  senderName?: string | null;
+  body: string;
+  replyToMessageId?: string | null;
+  isEdited: boolean;
+  editedAt?: string | null;
+  isDeleted: boolean;
+  deletedAt?: string | null;
+  createdAt: string;
+}
+
+export interface MessageAttachment {
+  id: string;
+  messageId: string;
+  fileName: string;
+  fileUrl: string;
+  fileSize: number;
+  mimeType: string;
+  thumbnailUrl?: string | null;
+  width?: number | null;
+  height?: number | null;
+  createdAt: string;
+}
+
+export interface MessageReaction {
+  id: string;
+  messageId: string;
+  userId: string;
+  emoji: string;
+  createdAt: string;
+}
+
+export interface ReactionSummary {
+  emoji: string;
+  count: number;
+  userIds: string[];
+  hasCurrentUser: boolean;
+}
+
+export interface UnreadInfo {
+  threadId: string;
+  unreadCount: number;
+  lastReadMessageId?: string | null;
+  lastReadAt: string;
+}
+
+export interface UserPresence {
+  userId: string;
+  status: "online" | "away" | "busy" | "offline";
+  lastSeenAt: string;
+}
+
+export interface PinnedMessage {
+  id: string;
+  threadId: string;
+  messageId: string;
+  pinnedBy: string;
+  pinnedAt: string;
+}
+
+export interface ChannelPermissions {
+  can_post?: boolean;
+  can_invite?: boolean;
+  can_delete_messages?: boolean;
+  can_pin_messages?: boolean;
+  can_manage_roles?: boolean;
+}
+
+export interface ChannelRole {
+  id: string;
+  channelId: string;
+  roleName: string;
+  permissions: ChannelPermissions;
+  createdAt: string;
+}
+
+export interface ThreadMemberWithPermissions {
+  id: string;
+  threadId: string;
+  userId: string;
+  role: string;
+  permissions: ChannelPermissions;
+  joinedAt: string;
+}
+
+export interface CommunityMessageExtended extends CommunityMessage {
+  attachments?: MessageAttachment[];
+  reactions?: ReactionSummary[];
+  replyPreview?: {
+    id: string;
+    senderId: string;
+    senderName?: string | null;
+    body: string;
+  } | null;
 }

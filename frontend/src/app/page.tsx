@@ -7,7 +7,7 @@ export default function Page() {
     <main className="min-h-screen bg-white text-slate-900">
       <TopNav />
       <div className="w-full bg-white">
-        <div className="mx-auto flex max-w-6xl flex-col items-center justify-center px-6 py-16 text-center">
+        <div className="mx-auto flex max-w-screen-2xl flex-col items-center justify-center px-4 py-12 text-center">
           <div className="space-y-3">
             <span className="inline-flex items-center gap-2 rounded-full border border-slate-200 bg-slate-50 px-4 py-1 text-[11px] uppercase tracking-[0.28em] text-slate-500">
               SmartWork platform

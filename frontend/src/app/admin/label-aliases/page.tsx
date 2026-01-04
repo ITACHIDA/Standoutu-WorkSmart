@@ -81,7 +81,9 @@ export default function LabelAliasesPage() {
     const set = new Set<string>();
     Object.keys(defaults || {}).forEach((k) => set.add(k));
     custom.forEach((c) => set.add(c.canonicalKey));
-    return Array.from(set).sort();
+    return Array.from(set)
+      .filter((key) => key !== APPLICATION_SUCCESS_KEY)
+      .sort();
   }, [defaults, custom]);
 
   const tagsForSelected: TagRow[] = useMemo(() => {
@@ -160,7 +162,7 @@ export default function LabelAliasesPage() {
           <p className="text-[11px] uppercase tracking-[0.28em] text-slate-500">Admin</p>
           <h1 className="text-3xl font-semibold text-slate-900">Label tags</h1>
           <p className="text-sm text-slate-600">
-            Choose a label on the left and manage its tags on the right. Built-ins stay read-only; add or edit the tags we match in autofill.
+            Choose a label on the left and manage its tags on the right. Built-ins stay read-only; add or edit tags used for autofill.
           </p>
         </div>
 

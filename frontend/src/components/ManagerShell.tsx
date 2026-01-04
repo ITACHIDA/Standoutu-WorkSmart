@@ -11,12 +11,13 @@ export default function ManagerShell({ children }: { children: React.ReactNode }
   const links = [
     { href: "/manager/profiles", label: "Profile management" },
     { href: "/manager/bidders", label: "Bidder management" },
+    { href: "/manager/applications", label: "Application management" },
   ];
 
   return (
     <main className="min-h-screen bg-white text-slate-900">
       <TopNav />
-      <div className="mx-auto w-full max-w-7xl px-8 py-8">
+      <div className="mx-auto w-full max-w-screen-2xl px-4 py-6">
         <div className="mb-4 flex items-center justify-between">
           <div className="text-sm text-slate-500">Manager console</div>
           <button

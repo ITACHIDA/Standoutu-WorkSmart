@@ -5,10 +5,18 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import { useRouter } from "next/navigation";
 import TopNav from "../../components/TopNav";
 
-const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "http://localhost:4000";
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE ?? "";
+const CONNECT_TIMEOUT_MS = 20000;
+const CHECK_TIMEOUT_MS = 10000;
 type DesktopBridge = {
   isElectron?: boolean;
   openJobWindow?: (url: string) => Promise<{ ok?: boolean; error?: string } | void>;
+};
+
+type WebviewHandle = HTMLElement & {
+  executeJavaScript: (code: string, userGesture?: boolean) => Promise<unknown>;
+  addEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
+  removeEventListener: (type: string, listener: EventListenerOrEventListenerObject) => void;
 };
 
 type User = {
@@ -60,6 +68,17 @@ type FillPlan = {
   filled?: { field: string; value: string; confidence?: number }[];
   suggestions?: { field: string; suggestion: string }[];
   blocked?: string[];
+  actions?: FillPlanAction[];
+};
+
+type FillPlanAction = {
+  field?: string;
+  field_id?: string;
+  label?: string;
+  selector?: string | null;
+  action?: "fill" | "select" | "check" | "uncheck" | "click" | "upload" | "skip";
+  value?: string;
+  confidence?: number;
 };
 
 type PageFieldCandidate = {
@@ -81,6 +100,10 @@ type AutofillResponse = {
   fillPlan: FillPlan;
   pageFields?: PageFieldCandidate[];
   candidateFields?: PageFieldCandidate[];
+};
+
+type ApplicationPhraseResponse = {
+  phrases: string[];
 };
 
 type AnalyzeResult = {
@@ -153,7 +176,6 @@ export default function Page() {
   const [frameLoaded, setFrameLoaded] = useState(false);
   const [streamFrame, setStreamFrame] = useState<string>("");
   const [status, setStatus] = useState<string>("Disconnected");
-  const [error, setError] = useState<string>("");
   const [loadingAction, setLoadingAction] = useState<string>("");
   const [streamConnected, setStreamConnected] = useState(false);
   const [analyzePopup, setAnalyzePopup] = useState<AnalyzePopupState | null>(null);
@@ -161,9 +183,15 @@ export default function Page() {
   const [showBaseInfo, setShowBaseInfo] = useState(false);
   const [baseInfoView, setBaseInfoView] = useState<BaseInfo>(() => cleanBaseInfo({}));
   const [webviewStatus, setWebviewStatus] = useState<"idle" | "loading" | "ready" | "failed">("idle");
-  const webviewRef = useRef<Element | null>(null);
+  const webviewRef = useRef<WebviewHandle | null>(null);
   const [isClient, setIsClient] = useState(false);
   const router = useRouter();
+  const showError = useCallback((message: string) => {
+    if (!message) return;
+    if (typeof window !== "undefined") {
+      window.alert(message);
+    }
+  }, []);
   const isBidder = user?.role === "BIDDER";
   const browserSrc = session?.url || url || "";
   const webviewPartition = "persist:smartwork-jobview";
@@ -188,6 +216,21 @@ export default function Page() {
     }
   }, [isClient, router]);
 
+  useEffect(() => {
+    if (!user) return;
+    const loadPhrases = async () => {
+      try {
+        const data = (await api("/application-phrases")) as ApplicationPhraseResponse;
+        if (data?.phrases?.length) {
+          setApplicationPhrases(data.phrases);
+        }
+      } catch (err) {
+        console.error("Failed to load application phrases", err);
+      }
+    };
+    void loadPhrases();
+  }, [user]);
+
   const desktopBridge: DesktopBridge | undefined =
     isClient && typeof window !== "undefined"
       ? (window as unknown as { smartwork?: DesktopBridge }).smartwork
@@ -201,10 +244,27 @@ export default function Page() {
 
   const appliedPct = metrics ? `${metrics.appliedPercentage}%` : "0%";
   const monthlyApplied = metrics?.monthlyApplied ?? 0;
-  const filledFields = fillPlan?.filled ?? [];
-  const fillSuggestions = fillPlan?.suggestions ?? [];
-  const fillBlocked = fillPlan?.blocked ?? [];
   const baseDraft = cleanBaseInfo(baseInfoView);
+  const normalizedCheckPhrases = useMemo(() => {
+    const merged = new Map<string, string>();
+    applicationPhrases.forEach((phrase) => {
+      const normalized = normalizeTextForMatch(phrase);
+      if (!normalized) return;
+      const squished = normalized.replace(/\s+/g, "");
+      merged.set(normalized, squished);
+    });
+    return Array.from(merged.entries()).map(([normalized, squished]) => ({
+      normalized,
+      squished,
+    }));
+  }, [applicationPhrases]);
+  const canCheck =
+    isElectron &&
+    Boolean(session) &&
+    checkEnabled &&
+    session?.status !== "SUBMITTED" &&
+    loadingAction !== "check" &&
+    loadingAction !== "go";
 
   async function loadResumes(profileId: string) {
     try {
@@ -239,6 +299,7 @@ export default function Page() {
     setCapturedFields([]);
     setStreamFrame("");
     setStreamConnected(false);
+    setCheckEnabled(false);
     const base = profiles.find((p) => p.id === selectedProfileId)?.baseInfo;
     setBaseInfoView(cleanBaseInfo(base ?? {}));
     setShowBaseInfo(false);
@@ -249,12 +310,14 @@ export default function Page() {
       setStreamFrame("");
       setStreamConnected(false);
       setFrameLoaded(false);
+      setCheckEnabled(false);
       return;
     }
     setStreamConnected(false);
     setStreamFrame("");
     setFrameLoaded(false);
-    const wsBase = API_BASE.replace(/^http/i, "ws");
+    const base = API_BASE.startsWith("http") ? API_BASE : window.location.origin;
+    const wsBase = base.replace(/^http/i, "ws");
     const ws = new WebSocket(`${wsBase}/ws/browser/${session.id}`);
     ws.onopen = () => setStreamConnected(true);
     ws.onmessage = (evt) => {
@@ -277,62 +340,484 @@ export default function Page() {
 
   useEffect(() => {
     setWebviewStatus("idle");
+    setCheckEnabled(false);
   }, [url]);
 
   useEffect(() => {
     if (!isElectron) return;
     setWebviewStatus("loading");
+    setCheckEnabled(false);
   }, [browserSrc, isElectron]);
 
   useEffect(() => {
     if (!isElectron || !webviewRef.current || !browserSrc) return;
     const view = webviewRef.current;
-    const handleReady = () => setWebviewStatus("ready");
-    const handleFail = () => setWebviewStatus("failed");
-    const handleStart = () => setWebviewStatus("loading");
+    const handleReady = () => {
+      setWebviewStatus("ready");
+      setCheckEnabled(true);
+    };
+    const handleDomReady = () => {
+      setWebviewStatus("ready");
+      setCheckEnabled(true);
+    };
+    const handleStop = () => {
+      setWebviewStatus("ready");
+      setCheckEnabled(true);
+    };
+    const handleFail = () => {
+      setWebviewStatus("failed");
+      setCheckEnabled(false);
+    };
+    const handleStart = () => {
+      setWebviewStatus("loading");
+      setCheckEnabled(false);
+    };
+    view.addEventListener("dom-ready", handleDomReady);
+    view.addEventListener("did-stop-loading", handleStop);
     view.addEventListener("did-finish-load", handleReady);
     view.addEventListener("did-fail-load", handleFail);
     view.addEventListener("did-start-loading", handleStart);
     return () => {
+      view.removeEventListener("dom-ready", handleDomReady);
+      view.removeEventListener("did-stop-loading", handleStop);
       view.removeEventListener("did-finish-load", handleReady);
       view.removeEventListener("did-fail-load", handleFail);
       view.removeEventListener("did-start-loading", handleStart);
     };
   }, [isElectron, browserSrc]);
 
+  const collectWebviewText = useCallback(async (): Promise<string> => {
+    const view = webviewRef.current;
+    if (!view) return "";
+    const script = `(() => {
+      const readText = (doc) => {
+        if (!doc) return '';
+        const body = doc.body;
+        const inner = body ? body.innerText || '' : '';
+        const content = body ? body.textContent || '' : '';
+        const title = doc.title || '';
+        return [title, inner, content].filter(Boolean).join('\\n');
+      };
+      const mainText = readText(document);
+      const frames = Array.from(document.querySelectorAll('iframe'));
+      const frameText = frames
+        .map((frame) => {
+          try {
+            const doc = frame.contentDocument;
+            return readText(doc);
+          } catch {
+            return '';
+          }
+        })
+        .filter(Boolean)
+        .join('\\n');
+      return [mainText, frameText].filter(Boolean).join('\\n');
+    })()`;
+    try {
+      const result = await view.executeJavaScript(script, true);
+      setWebviewStatus("ready");
+      return typeof result === "string" ? result : "";
+    } catch (err) {
+      console.error("Failed to read webview text", err);
+      return "";
+    }
+  }, []);
+
+  const collectWebviewFields = useCallback(async (): Promise<PageFieldCandidate[]> => {
+    const view = webviewRef.current;
+    if (!view) return [];
+    const script = `(() => {
+      const fields = [];
+      const norm = (s) => (s || '').replace(/\\s+/g, ' ').trim();
+      const textOf = (el) => norm(el && (el.textContent || el.innerText || ''));
+      const getWin = (el) =>
+        (el && el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView : window);
+      const isVisible = (el) => {
+        const win = getWin(el);
+        const cs = win.getComputedStyle(el);
+        if (!cs || cs.display === 'none' || cs.visibility === 'hidden') return false;
+        const r = el.getBoundingClientRect();
+        return r.width > 0 && r.height > 0;
+      };
+      const esc = (doc, v) => {
+        const css = doc.defaultView && doc.defaultView.CSS;
+        return css && css.escape ? css.escape(v) : v.replace(/[^a-zA-Z0-9_-]/g, '\\\\$&');
+      };
+      const getLabelText = (el, doc) => {
+        try {
+          const labels = el.labels;
+          if (labels && labels.length) {
+            const t = Array.from(labels).map((n) => textOf(n)).filter(Boolean);
+            if (t.length) return t.join(' ');
+          }
+        } catch {
+          /* ignore */
+        }
+        const id = el.getAttribute('id');
+        if (id) {
+          const lab = doc.querySelector('label[for="' + esc(doc, id) + '"]');
+          const t = textOf(lab);
+          if (t) return t;
+        }
+        const wrap = el.closest('label');
+        const t2 = textOf(wrap);
+        return t2 || '';
+      };
+      const getAriaName = (el, doc) => {
+        const direct = norm(el.getAttribute('aria-label'));
+        if (direct) return direct;
+        const labelledBy = norm(el.getAttribute('aria-labelledby'));
+        if (labelledBy) {
+          const parts = labelledBy
+            .split(/\\s+/)
+            .map((id) => textOf(doc.getElementById(id)))
+            .filter(Boolean);
+          return norm(parts.join(' '));
+        }
+        return '';
+      };
+      let uid = 0;
+      const collectFrom = (doc, prefix) => {
+        const nodes = Array.from(
+          doc.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]'),
+        );
+        for (const el of nodes) {
+          const tag = el.tagName.toLowerCase();
+          const typeAttr = (el.getAttribute('type') || '').toLowerCase();
+          const isRich = el.getAttribute('contenteditable') === 'true' || el.getAttribute('role') === 'textbox';
+          let type = 'text';
+          if (tag === 'select') type = 'select';
+          else if (tag === 'textarea') type = 'textarea';
+          else if (tag === 'input') type = typeAttr || el.type || 'text';
+          else if (isRich) type = 'richtext';
+          else type = tag;
+          if (['submit', 'button', 'reset', 'image', 'hidden', 'file'].includes(type)) continue;
+          if (el.disabled) continue;
+          if (!isVisible(el)) continue;
+          let key = el.getAttribute('data-smartwork-field');
+          if (!key) {
+            key = 'sw-' + prefix + '-' + uid;
+            uid += 1;
+            el.setAttribute('data-smartwork-field', key);
+          }
+          fields.push({
+            field_id: el.getAttribute('name') || null,
+            id: el.id || null,
+            name: el.getAttribute('name') || null,
+            label: getLabelText(el, doc) || null,
+            ariaName: getAriaName(el, doc) || null,
+            placeholder: el.getAttribute('placeholder') || null,
+            type: type || null,
+            required: Boolean(el.required),
+            selector: '[data-smartwork-field="' + key + '"]',
+          });
+          if (fields.length >= 300) break;
+        }
+      };
+      collectFrom(document, 'main');
+      const frames = Array.from(document.querySelectorAll('iframe'));
+      frames.forEach((frame, idx) => {
+        try {
+          const doc = frame.contentDocument;
+          if (doc) collectFrom(doc, 'frame' + idx);
+        } catch {
+          /* ignore */
+        }
+      });
+      return fields;
+    })()`;
+    try {
+      const result = await view.executeJavaScript(script, true);
+      setWebviewStatus("ready");
+      return Array.isArray(result) ? (result as PageFieldCandidate[]) : [];
+    } catch (err) {
+      console.error("Failed to read webview fields", err);
+      return [];
+    }
+  }, []);
+
+  const applyAutofillActions = useCallback(async (actions: FillPlanAction[]) => {
+    const view = webviewRef.current;
+    if (!view || !actions?.length) return null;
+    const payload = JSON.stringify(actions);
+    const script = `(() => {
+      const actions = ${payload};
+      const results = { filled: [], blocked: [] };
+      const norm = (s) => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
+      const escAttr = (doc, v) => {
+        const css = doc.defaultView && doc.defaultView.CSS;
+        return css && css.escape ? css.escape(v) : v.replace(/["\\\\]/g, '\\\\$&');
+      };
+      const collectDocs = () => {
+        const docs = [document];
+        const frames = Array.from(document.querySelectorAll('iframe'));
+        frames.forEach((frame) => {
+          try {
+            const doc = frame.contentDocument;
+            if (doc) docs.push(doc);
+          } catch {
+            /* ignore */
+          }
+        });
+        return docs;
+      };
+      const dispatch = (el) => {
+        const win =
+          (el.ownerDocument && el.ownerDocument.defaultView ? el.ownerDocument.defaultView : window);
+        el.dispatchEvent(new win.Event('input', { bubbles: true }));
+        el.dispatchEvent(new win.Event('change', { bubbles: true }));
+      };
+      const selectOption = (el, value) => {
+        const val = String(value ?? '');
+        const options = Array.from(el.options || []);
+        const exact = options.find((o) => o.value === val || o.label === val);
+        const soft = options.find((o) => o.label && o.label.toLowerCase() === val.toLowerCase());
+        const match = exact || soft;
+        if (match) {
+          el.value = match.value;
+          dispatch(el);
+          return true;
+        }
+        el.value = val;
+        dispatch(el);
+        return false;
+      };
+      const setValue = (el, value) => {
+        const val = String(value ?? '');
+        if (typeof el.focus === 'function') el.focus();
+        if (el.isContentEditable) {
+          el.textContent = val;
+        } else {
+          el.value = val;
+        }
+        dispatch(el);
+      };
+      const findByLabel = (doc, label) => {
+        if (!label) return null;
+        const target = norm(label);
+        if (!target) return null;
+        const labels = Array.from(doc.querySelectorAll('label'));
+        for (const lab of labels) {
+          const text = norm(lab.textContent || '');
+          if (!text) continue;
+          if (text === target || text.includes(target)) {
+            if (lab.control) return lab.control;
+            const forId = lab.getAttribute('for');
+            if (forId) return doc.getElementById(forId);
+          }
+        }
+        return null;
+      };
+      const findByNameOrId = (doc, value) => {
+        if (!value) return null;
+        const esc = escAttr(doc, String(value));
+        return (
+          doc.querySelector('[name="' + esc + '"]') ||
+          doc.getElementById(value) ||
+          doc.querySelector('#' + esc)
+        );
+      };
+      const findByHint = (doc, hint) => {
+        if (!hint) return null;
+        const target = norm(hint);
+        if (!target) return null;
+        const nodes = Array.from(
+          doc.querySelectorAll('input, textarea, select, [contenteditable="true"], [role="textbox"]'),
+        );
+        for (const el of nodes) {
+          const placeholder = norm(el.getAttribute('placeholder'));
+          const aria = norm(el.getAttribute('aria-label'));
+          const name = norm(el.getAttribute('name'));
+          const id = norm(el.getAttribute('id'));
+          if ([placeholder, aria, name, id].some((v) => v && v.includes(target))) {
+            return el;
+          }
+        }
+        return null;
+      };
+      const findElement = (doc, step) => {
+        let el = null;
+        if (step.selector && typeof step.selector === 'string') {
+          try {
+            el = doc.querySelector(step.selector);
+          } catch {
+            el = null;
+          }
+        }
+        if (!el) el = findByNameOrId(doc, step.field_id || step.field);
+        if (!el) el = findByLabel(doc, step.label);
+        if (!el) el = findByHint(doc, step.label || step.field_id || step.field);
+        return el;
+      };
+      const docs = collectDocs();
+      for (const step of actions) {
+        const action = step.action || 'fill';
+        if (action === 'skip') continue;
+        let el = null;
+        for (const doc of docs) {
+          el = findElement(doc, step);
+          if (el) break;
+        }
+        if (!el) {
+          results.blocked.push(step.field || step.selector || step.label || 'field');
+          continue;
+        }
+        if (action === 'upload') {
+          results.blocked.push(step.field || step.selector || 'upload');
+          continue;
+        }
+        if (action === 'click') {
+          el.click();
+          results.filled.push({ field: step.field || step.selector || 'field', value: 'click' });
+          continue;
+        }
+        if (action === 'check' || action === 'uncheck') {
+          if ('checked' in el) {
+            el.checked = action === 'check';
+            dispatch(el);
+            results.filled.push({ field: step.field || step.selector || 'field', value: action });
+          } else {
+            results.blocked.push(step.field || step.selector || 'field');
+          }
+          continue;
+        }
+        if (action === 'select') {
+          if (el.tagName.toLowerCase() === 'select') {
+            selectOption(el, step.value);
+          } else {
+            setValue(el, step.value);
+          }
+          results.filled.push({ field: step.field || step.selector || 'field', value: String(step.value ?? '') });
+          continue;
+        }
+        if (el.tagName.toLowerCase() === 'select') {
+          selectOption(el, step.value);
+          results.filled.push({ field: step.field || step.selector || 'field', value: String(step.value ?? '') });
+          continue;
+        }
+        setValue(el, step.value);
+        results.filled.push({ field: step.field || step.selector || 'field', value: String(step.value ?? '') });
+      }
+      return results;
+    })()`;
+    try {
+      const result = await view.executeJavaScript(script, true);
+      if (result && typeof result === "object") {
+        return result as { filled?: { field: string; value: string }[]; blocked?: string[] };
+      }
+      return null;
+    } catch (err) {
+      console.error("Failed to apply autofill in webview", err);
+      return null;
+    }
+  }, []);
+
   async function handleGo() {
     if (!user || !selectedProfileId || !url) return;
     setLoadingAction("go");
-    setError("");
+    setCheckEnabled(false);
     try {
-      const newSession: ApplicationSession = await api("/sessions", {
-        method: "POST",
-        body: JSON.stringify({
-          bidderUserId: user.id,
-          profileId: selectedProfileId,
-          url,
-          selectedResumeId: resumeChoice,
+      const newSession: ApplicationSession = await withTimeout(
+        api("/sessions", {
+          method: "POST",
+          body: JSON.stringify({
+            bidderUserId: user.id,
+            profileId: selectedProfileId,
+            url,
+            selectedResumeId: resumeChoice,
+          }),
         }),
-      });
+        CONNECT_TIMEOUT_MS,
+        "Connecting timed out. Please try again."
+      );
       setSession(newSession);
       setStatus("Connecting to remote browser...");
-      await api(`/sessions/${newSession.id}/go`, { method: "POST" }).catch((err) => {
-        console.error(err);
-      });
+      await withTimeout(
+        api(`/sessions/${newSession.id}/go`, { method: "POST" }),
+        CONNECT_TIMEOUT_MS,
+        "Connecting timed out. Please try again."
+      );
       setStatus("Connected to remote browser");
       void refreshMetrics();
     } catch (err) {
       console.error(err);
-      setError("Failed to start session. Check backend logs.");
+      const message =
+        err instanceof Error && err.message
+          ? err.message
+          : "Failed to start session. Check backend logs.";
+      showError(message);
+      setStatus("Connection failed");
     } finally {
       setLoadingAction("");
+    }
+  }
+
+  async function handleCheck() {
+    if (!session) return;
+    setLoadingAction("check");
+    setCheckEnabled(false);
+    let didSubmit = false;
+    try {
+      if (!isElectron) {
+        showError("Check is only available in the desktop app.");
+        return;
+      }
+      if (!webviewRef.current) {
+        showError("Embedded browser is not ready yet. Try again in a moment.");
+        return;
+      }
+      if (webviewStatus === "failed") {
+        showError("Embedded browser failed to load. Try again or open in a browser tab.");
+        return;
+      }
+      if (!applicationPhrases.length) {
+        showError("No check phrases configured. Ask an admin to add them.");
+        return;
+      }
+      const pageText = await withTimeout(
+        collectWebviewText(),
+        CHECK_TIMEOUT_MS,
+        "Check timed out. Please try again."
+      );
+      const normalizedPage = normalizeTextForMatch(pageText);
+      if (!normalizedPage) {
+        showError("No text found on the page to check yet.");
+        return;
+      }
+      const squishedPage = normalizedPage.replace(/\s+/g, "");
+      const matchedPhrase = normalizedCheckPhrases.find(
+        (phrase) =>
+          normalizedPage.includes(phrase.normalized) ||
+          (phrase.squished && squishedPage.includes(phrase.squished))
+      );
+      if (!matchedPhrase) {
+        showError("No submission confirmation detected yet.");
+        return;
+      }
+      await withTimeout(
+        api(`/sessions/${session.id}/mark-submitted`, { method: "POST" }),
+        CHECK_TIMEOUT_MS,
+        "Check timed out. Please try again."
+      );
+      setSession({ ...session, status: "SUBMITTED" });
+      didSubmit = true;
+      if (user?.id) {
+        await refreshMetrics(user.id);
+      }
+    } catch (err) {
+      console.error(err);
+      showError("Check failed. Backend must be running.");
+    } finally {
+      setLoadingAction("");
+      if (!didSubmit && isElectron && webviewStatus === "ready") {
+        setCheckEnabled(true);
+      }
     }
   }
 
   async function handleAnalyze() {
     if (!session) return;
     setLoadingAction("analyze");
-    setError("");
     setAnalyzePopup(null);
     try {
       const res = await api(`/sessions/${session.id}/analyze`, {
@@ -382,7 +867,7 @@ export default function Page() {
       });
     } catch (err) {
       console.error(err);
-      setError("Analyse failed. Backend must be running.");
+      showError("Analyse failed. Backend must be running.");
     } finally {
       setLoadingAction("");
     }
@@ -391,19 +876,36 @@ export default function Page() {
   async function handleAutofill() {
     if (!session) return;
     setLoadingAction("autofill");
-    setError("");
-    setCapturedFields([]);
     try {
+      const isDesktop = isElectron;
+      if (isDesktop && !webviewRef.current) {
+        showError("Embedded browser is not ready yet. Try again in a moment.");
+        setLoadingAction("");
+        return;
+      }
+      if (isDesktop && webviewStatus === "failed") {
+        showError("Embedded browser failed to load. Try again or open in a browser tab.");
+        setLoadingAction("");
+        return;
+      }
+      const pageFields = isDesktop ? await collectWebviewFields() : [];
+      if (isDesktop && pageFields.length === 0) {
+        showError("No form fields detected in the embedded browser. Try again after the form loads.");
+        setLoadingAction("");
+        return;
+      }
       const res = (await api(`/sessions/${session.id}/autofill`, {
         method: "POST",
-        body: JSON.stringify({ selectedResumeId: resumeChoice || undefined, useLlm: useLlmAutofill }),
+        body: JSON.stringify({
+          selectedResumeId: resumeChoice || undefined,
+          useLlm: useLlmAutofill,
+          pageFields: isDesktop ? pageFields : undefined,
+        }),
       })) as AutofillResponse;
-      setFillPlan(res.fillPlan);
-      const detected =
-        (res.pageFields?.length ? res.pageFields : undefined) ??
-        (res.candidateFields?.length ? res.candidateFields : []) ??
-        [];
-      setCapturedFields(detected);
+      const canApply = isElectron && Boolean(webviewRef.current) && Boolean(browserSrc);
+      if (canApply && res.fillPlan?.actions?.length) {
+        await applyAutofillActions(res.fillPlan.actions);
+      }
       setSession({
         ...session,
         status: "FILLED",
@@ -411,7 +913,7 @@ export default function Page() {
       });
     } catch (err) {
       console.error(err);
-      setError("Autofill failed. Backend must be running.");
+      showError("Autofill failed. Backend must be running.");
     } finally {
       setLoadingAction("");
     }
@@ -482,7 +984,7 @@ export default function Page() {
     <>
     <main className="min-h-screen w-full bg-white text-slate-900">
       <TopNav />
-      <div className="mx-auto w-full max-w-7xl px-6 py-8 space-y-4">
+      <div className="mx-auto w-full max-w-screen-2xl px-4 py-6 space-y-4">
         <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
           <div>
             <p className="text-[11px] uppercase tracking-[0.24em] text-slate-700">
@@ -499,12 +1001,6 @@ export default function Page() {
             </div>
           </div>
         </div>
-
-        {error && (
-          <div className="rounded-xl border border-red-400/50 bg-red-500/10 px-4 py-3 text-sm text-red-100">
-            {error}
-          </div>
-        )}
 
         {user ? null : null}
 
@@ -584,13 +1080,22 @@ export default function Page() {
                   placeholder="https://"
                   className="w-full rounded-xl bg-slate-100 px-3 py-2 text-sm text-slate-900 outline-none ring-1 ring-white/10"
                 />
-                <button
-                  onClick={handleGo}
-                  disabled={loadingAction === "go" || !selectedProfileId}
-                  className="min-w-[110px] rounded-xl bg-[#4ade80] px-4 py-2 text-sm font-semibold text-[#0b1224] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
-                >
-                  {loadingAction === "go" ? "Connecting..." : "Go"}
-                </button>
+                <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row">
+                  <button
+                    onClick={handleGo}
+                    disabled={loadingAction === "go" || !selectedProfileId}
+                    className="min-w-[110px] rounded-xl bg-[#4ade80] px-4 py-2 text-sm font-semibold text-[#0b1224] transition hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {loadingAction === "go" ? "Connecting..." : "Go"}
+                  </button>
+                  <button
+                    onClick={handleCheck}
+                    disabled={!canCheck}
+                    className="min-w-[110px] rounded-xl border border-slate-200 bg-white px-4 py-2 text-sm font-semibold text-slate-800 transition hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {loadingAction === "check" ? "Checking..." : "Check"}
+                  </button>
+                </div>
               </div>
             </div>
 
@@ -626,7 +1131,7 @@ export default function Page() {
                         key={browserSrc}
                         src={browserSrc}
                         partition={webviewPartition}
-                        allowpopups={true}
+                        allowpopups="true"
                         style={{ height: "100%", width: "100%", backgroundColor: "#020617" }}
                       />
                       <div className="absolute top-2 right-3 flex items-center gap-2 text-[11px] text-slate-800">
@@ -806,96 +1311,6 @@ export default function Page() {
               >
                 {loadingAction === "autofill" ? "Filling..." : "Autofill"}
               </button>
-              <div className="space-y-3">
-                <div className="space-y-2 rounded-xl bg-slate-100 px-3 py-3 text-sm text-slate-800">
-                  <div className="flex items-center justify-between">
-                    <span className="text-slate-800">Filled</span>
-                    <span className="text-xs text-[#5ef3c5]">
-                      {filledFields.length}
-                    </span>
-                  </div>
-                  <div className="space-y-1 text-xs text-slate-700">
-                    {filledFields.length ? (
-                      filledFields.map((f) => (
-                        <div key={f.field} className="flex items-center justify-between">
-                          <span>{f.field}</span>
-                          <span className="text-[#5ef3c5]">{f.value}</span>
-                        </div>
-                      ))
-                    ) : (
-                      <div>No fields filled yet.</div>
-                    )}
-                  </div>
-                  {fillSuggestions.length ? (
-                    <div className="pt-2">
-                      <div className="text-xs text-slate-800">Needs review</div>
-                      <div className="space-y-1 text-xs text-slate-700">
-                        {fillSuggestions.map((s) => (
-                          <div key={s.field}>
-                            {s.field}: {s.suggestion}
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                  {fillBlocked.length ? (
-                    <div className="pt-2">
-                      <div className="text-xs text-red-300">Blocked</div>
-                      <div className="flex flex-wrap gap-1 text-[11px] text-red-200">
-                        {fillBlocked.map((b) => (
-                          <span
-                            key={b}
-                            className="rounded-full bg-red-500/10 px-2 py-1"
-                          >
-                            {b}
-                          </span>
-                        ))}
-                      </div>
-                    </div>
-                  ) : null}
-                </div>
-                <div className="rounded-xl border border-dashed border-slate-200 bg-slate-50 px-3 py-3 text-xs text-slate-700">
-                  <div className="flex items-center justify-between">
-                    <span className="text-sm font-semibold text-slate-800">Captured fields</span>
-                    <span className="rounded-full bg-white px-3 py-1 text-[11px] text-slate-700">
-                      {capturedFields.length}
-                    </span>
-                  </div>
-                  {capturedFields.length ? (
-                    <div className="mt-2 max-h-56 space-y-1 overflow-auto">
-                      {capturedFields.slice(0, 50).map((f, idx) => {
-                        const title =
-                          f.questionText || f.label || f.placeholder || f.field_id || `Field ${idx + 1}`;
-                        const metaParts = [
-                          f.type,
-                          f.required ? "required" : null,
-                          f.selector || f.locators?.css,
-                        ].filter((v): v is string => Boolean(v));
-                        const meta = metaParts.join(" · ");
-                        return (
-                          <div
-                            key={`${f.field_id ?? f.selector ?? f.name ?? f.label ?? idx}-${idx}`}
-                            className="rounded-lg bg-white px-2 py-1"
-                          >
-                            <div className="text-[12px] font-semibold text-slate-900">
-                              {title}
-                            </div>
-                            {meta ? (
-                              <div className="text-[11px] text-slate-600">
-                                {meta}
-                              </div>
-                            ) : null}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ) : (
-                    <div className="mt-2 text-[11px] text-slate-600">
-                      Click Autofill to capture the fields we detected on the page.
-                    </div>
-                  )}
-                </div>
-              </div>
             </div>
 
             <div className="rounded-2xl border border-slate-200 bg-white p-4 space-y-3">
@@ -1174,4 +1589,22 @@ function safeHostname(url: string) {
   } catch {
     return "N/A";
   }
+}
+
+function normalizeTextForMatch(text: string) {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number, timeoutMessage: string) {
+  let timeoutId: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<T>((_, reject) => {
+    timeoutId = setTimeout(() => reject(new Error(timeoutMessage)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    if (timeoutId) clearTimeout(timeoutId);
+  });
 }

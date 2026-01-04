@@ -40,13 +40,14 @@ export default function TopNav() {
 
   return (
     <header className="w-full border-b border-white/5 bg-[#0b1020] backdrop-blur">
-      <div className="mx-auto flex w-full max-w-7xl items-center justify-between px-6 py-4 text-sm">
+      <div className="mx-auto flex w-full max-w-screen-2xl items-center justify-between px-4 py-3 text-sm">
         <div className="text-lg font-semibold text-white">
           <Link href="/">SmartWork</Link>
         </div>
         <nav className="flex items-center gap-2">
           <NavItem href="/" label="Home" active={pathname === '/'} />
           <NavItem href="/workspace" label="Workspace" active={pathname.startsWith('/workspace')} />
+          <NavItem href="/community" label="Community" active={pathname.startsWith('/community')} />
           <NavItem href="/calendar" label="Calendar" active={pathname.startsWith('/calendar')} />
           <NavItem href="/about" label="About" active={pathname.startsWith('/about')} />
           <NavItem href="/career" label="Career" active={pathname.startsWith('/career')} />

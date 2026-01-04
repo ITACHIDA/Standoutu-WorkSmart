@@ -331,7 +331,7 @@ export default function CalendarPage() {
         setDisconnectingId(null);
       }
     },
-    [fetchEvents, signOut, token, viewRange],
+    [fetchEvents, token, viewRange],
   );
 
   const handleSyncMailboxes = useCallback(() => {

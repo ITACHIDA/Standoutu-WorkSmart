@@ -85,7 +85,7 @@ export function useMessageActions({
     setUploading(true);
     setError?.('');
     try {
-      const attachmentIds: string[] = [];
+      const attachments: any[] = [];
       for (let i = 0; i < selectedFiles.length; i++) {
         const file = selectedFiles[i];
         const formData = new FormData();
@@ -101,19 +101,16 @@ export function useMessageActions({
           token,
         );
 
-        const attachmentPayload = {
-          id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36),
-          fileUrl: uploaded.fileUrl,
+        attachments.push({
           fileName: uploaded.fileName,
+          fileUrl: uploaded.fileUrl,
           fileSize: uploaded.fileSize,
           mimeType: uploaded.mimeType,
-        };
-
-        attachmentIds.push(attachmentPayload.id);
+        });
       }
-      const payload: { body: string; replyToMessageId?: string; attachmentIds?: string[] } = {
-        body: draftMessage.trim() || 'Attachment',
-        attachmentIds,
+      const payload: { body: string; replyToMessageId?: string; attachments?: any[] } = {
+        body: draftMessage.trim(),
+        attachments,
       };
       if (replyingTo) {
         payload.replyToMessageId = replyingTo.id;

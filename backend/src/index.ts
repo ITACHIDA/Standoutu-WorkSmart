@@ -2164,8 +2164,8 @@ async function bootstrap() {
     });
     const body = schema.parse(request.body);
     const text = body.body.trim();
-    if (!text)
-      return reply.status(400).send({ message: "Message body required" });
+    if (!text && (!body.attachments || body.attachments.length === 0))
+      return reply.status(400).send({ message: "Message body or attachments required" });
     const thread = await ensureCommunityThreadAccess(id, actor, reply);
     if (!thread) return;
 
@@ -2188,7 +2188,7 @@ async function bootstrap() {
       id: randomUUID(),
       threadId: id,
       senderId: actor.id,
-      body: text,
+      body: text || '',
       replyToMessageId: body.replyToMessageId ?? null,
       isEdited: false,
       isDeleted: false,

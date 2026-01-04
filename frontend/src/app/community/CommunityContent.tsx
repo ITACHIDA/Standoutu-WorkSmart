@@ -367,7 +367,7 @@ export function CommunityContent() {
           />
 
           <section
-            className="flex min-h-[70vh] max-h-[80vh] w-full max-w-4xl min-w-[300px] flex-1 flex-col rounded-3xl border border-slate-200 bg-white shadow-sm"
+            className="relative flex min-h-[70vh] max-h-[80vh] w-full max-w-4xl min-w-[300px] flex-1 flex-col rounded-3xl border border-slate-200 bg-white shadow-sm overflow-hidden"
             style={{
               animation: 'soft-rise 0.5s ease both',
               animationDelay: '60ms',
@@ -396,28 +396,31 @@ export function CommunityContent() {
               </div>
             </div>
 
-            {showPinned && <PinnedMessages pinnedMessages={pinnedMessages} onUnpin={(msgId) => handleUnpinMessage(msgId, setPinnedMessages)} />}
+            <div className="relative flex-1 flex flex-col overflow-hidden">
+              {showPinned && <PinnedMessages pinnedMessages={pinnedMessages} onUnpin={(msgId) => handleUnpinMessage(msgId, setPinnedMessages)} />}
 
-            <MessageList
-              messages={messages}
-              currentTyping={currentTyping}
-              activeType={activeType}
-              userId={user?.id}
-              messagesLoading={messagesLoading}
-              hasMore={hasMore}
-              loadingMore={loadingMore}
-              hoveredMessageId={hoveredMessageId}
-              messageRefs={messageRefs}
-              onLoadMore={loadMoreMessages}
-              onScroll={() => {}}
-              onReaction={(msgId, emoji) => handleReaction(msgId, emoji, messages, setMessages)}
-              onContextMenu={(e, msg) => {
-                e.preventDefault();
-                setContextMenu({ x: e.clientX, y: e.clientY, message: msg });
-              }}
-              onReplyClick={handleReplyClick}
-              onHoverChange={setHoveredMessageId}
-            />
+              <MessageList
+                messages={messages}
+                currentTyping={currentTyping}
+                activeType={activeType}
+                userId={user?.id}
+                messagesLoading={messagesLoading}
+                hasMore={hasMore}
+                loadingMore={loadingMore}
+                hoveredMessageId={hoveredMessageId}
+                messageRefs={messageRefs}
+                pinnedMessageIds={new Set(pinnedMessages.map(p => p.messageId))}
+                onLoadMore={loadMoreMessages}
+                onScroll={() => {}}
+                onReaction={(msgId, emoji) => handleReaction(msgId, emoji, messages, setMessages)}
+                onContextMenu={(e, msg) => {
+                  e.preventDefault();
+                  setContextMenu({ x: e.clientX, y: e.clientY, message: msg });
+                }}
+                onReplyClick={handleReplyClick}
+                onHoverChange={setHoveredMessageId}
+              />
+            </div>
 
             <MessageInput
               draftMessage={draftMessage}
@@ -462,12 +465,14 @@ export function CommunityContent() {
           y={contextMenu.y}
           message={contextMenu.message}
           userId={user?.id}
+          pinnedMessages={pinnedMessages}
           onEdit={(msg) => {
             setEditingMessage(msg);
             setEditDraft(msg.body);
           }}
           onReply={setReplyingTo}
           onPin={handlePinMessage}
+          onUnpin={(msgId) => handleUnpinMessage(msgId, setPinnedMessages)}
           onDelete={(msgId) => handleDeleteMessage(msgId, messages, setMessages)}
           onClose={() => setContextMenu(null)}
         />

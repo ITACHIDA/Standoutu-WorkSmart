@@ -100,6 +100,8 @@ export function useCommunityData({ token, userId }: UseCommunityDataProps) {
         undefined,
         authToken,
       );
+      console.log(list)
+
       setMessages(dedupeMessages(list ?? []));
       setHasMore((list || []).length === 50);
     } catch (err) {
